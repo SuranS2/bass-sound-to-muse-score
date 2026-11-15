@@ -181,3 +181,50 @@ def test_infer_key_fifths_and_half_measure_chords_use_flats(tmp_path: Path) -> N
     assert int(root.findtext(".//attributes/key/fifths")) < 0
     m1_offsets = [h.findtext("offset") for h in root.findall(".//measure[@number='1']/harmony")]
     assert m1_offsets == [None, "8"]
+
+
+def test_quantize_recovers_odd_16th_rest_jitter_in_fast_eight_beat() -> None:
+    from bass_mcp.score_builder import _quantize_notes_to_grid
+
+    bpm = 172.0
+    eighth = 30.0 / bpm
+    # Beat 3 (slot 4) clean, beat 3+ (slot 6) omitted -> late onset lands on odd 16th slot 9 (4.5 beats? slot 8+1)
+    notes = assign_bass_tab_positions(
+        [
+            BassNote(29, "F1", 0 * eighth, 0.17, 85),
+            BassNote(29, "F1", 1 * eighth, 0.16, 80),
+            BassNote(29, "F1", 2 * eighth, 0.17, 82),
+            BassNote(29, "F1", 3 * eighth, 0.16, 79),
+            BassNote(29, "F1", 4.55 * eighth, 0.11, 82),  # lands at div 9 instead of div 8
+            BassNote(29, "F1", 5 * eighth, 0.17, 84),     # div 10
+            BassNote(29, "F1", 6 * eighth, 0.17, 84),     # div 12
+            BassNote(29, "F1", 7 * eighth, 0.16, 78),     # div 14
+        ],
+        string_count=4,
+    )
+    _, grid = _quantize_notes_to_grid(notes, bpm=bpm, beats_per_measure=4)
+    assert [(it["start_div"], it["dur_div"]) for it in grid] == [
+        (0, 2), (2, 2), (4, 2), (6, 2), (8, 2), (10, 2), (12, 2), (14, 2)
+    ]
+
+
+def test_write_musicxml_embeds_escaped_synced_lyrics(tmp_path: Path) -> None:
+    from bass_mcp.metadata import LyricLine
+
+    notes = assign_bass_tab_positions(
+        [BassNote(29, "F1", i * 0.35, 0.30, 85) for i in range(8)],
+        string_count=4,
+    )
+    chords = infer_measure_chords(notes, bpm=172.0)
+    lyrics = [
+        LyricLine(0.0, "I am <standing>"),
+        LyricLine(1.4, "in the line & holding"),
+    ]
+    xml_path = tmp_path / "with_lyrics.musicxml"
+    write_musicxml_score(notes, chords, xml_path, bpm=172.0, lyrics=lyrics)
+    raw = xml_path.read_text(encoding="utf-8")
+    assert "&lt;standing&gt;" in raw
+    root = ET.parse(xml_path).getroot()
+    lyric_texts = [el.text for el in root.findall(".//lyric/text")]
+    assert any("I am <standing>" in (t or "") for t in lyric_texts)
+    assert any("in the line" in (t or "") for t in lyric_texts)

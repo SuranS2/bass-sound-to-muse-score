@@ -133,6 +133,30 @@ def _fit_pitch_to_bass_range(pitch_midi: int, min_midi: int, max_midi: int) -> i
     return max(min_midi, min(max_midi, p))
 
 
+def compute_onset_shift_sec(
+    notes: list[BassNote],
+    min_trim_sec: float = 0.25,
+    bpm: float | None = None,
+    beats_per_measure: int = 4,
+    preserve_intro_bars: bool = False,
+) -> float:
+    """Return leading time shift (seconds) used to align note onsets to bar boundaries."""
+    if not notes:
+        return 0.0
+    t0 = min(n.onset_sec for n in notes)
+    if preserve_intro_bars and bpm and bpm > 0:
+        measure_sec = beats_per_measure * (60.0 / max(bpm, 20.0))
+        if t0 < 0.75 * measure_sec:
+            return t0 if t0 > min_trim_sec else 0.0
+        bars_raw = t0 / measure_sec
+        frac = bars_raw - int(bars_raw)
+        if frac <= 0.40 or frac >= 0.85:
+            intro_bars = max(0, int(round(bars_raw)))
+            return t0 - intro_bars * measure_sec
+        return 0.0
+    return t0 if t0 > min_trim_sec else 0.0
+
+
 def normalize_note_onsets(
     notes: list[BassNote],
     min_trim_sec: float = 0.25,
@@ -144,24 +168,13 @@ def normalize_note_onsets(
     if not notes:
         return []
     ordered = sorted(notes, key=lambda n: n.onset_sec)
-    t0 = ordered[0].onset_sec
-    if preserve_intro_bars and bpm and bpm > 0:
-        measure_sec = beats_per_measure * (60.0 / max(bpm, 20.0))
-        if t0 < 0.75 * measure_sec:
-            shift = t0 if t0 > min_trim_sec else 0.0
-        else:
-            bars_raw = t0 / measure_sec
-            frac = bars_raw - int(bars_raw)
-            if frac <= 0.40 or frac >= 0.85:
-                intro_bars = max(0, int(round(bars_raw)))
-                shift = t0 - intro_bars * measure_sec
-            else:
-                shift = 0.0
-    else:
-        if t0 <= min_trim_sec:
-            return ordered
-        shift = t0
-
+    shift = compute_onset_shift_sec(
+        ordered,
+        min_trim_sec=min_trim_sec,
+        bpm=bpm,
+        beats_per_measure=beats_per_measure,
+        preserve_intro_bars=preserve_intro_bars,
+    )
     if abs(shift) < 1e-4:
         return ordered
     return [
@@ -556,10 +569,14 @@ def _quantize_notes_to_grid(
         start_div = max(0, int(round(raw_start)))
         prev_ioi = (n.onset_sec - ordered[idx - 1].onset_sec) if idx > 0 else float("inf")
         next_ioi = (ordered[idx + 1].onset_sec - n.onset_sec) if idx + 1 < len(ordered) else float("inf")
-        if start_div % 2 == 1 and min(prev_ioi, next_ioi) >= 0.75 * (2.0 * div_sec):
+        even_ioi_ok = min(prev_ioi, next_ioi) >= 0.68 * (2.0 * div_sec) or (
+            (prev_ioi + next_ioi) >= 1.75 * (2.0 * div_sec)
+            and min(prev_ioi, next_ioi) >= 0.60 * (2.0 * div_sec)
+        )
+        if start_div % 2 == 1 and even_ioi_ok:
             candidates = [c for c in (start_div - 1, start_div + 1) if c >= 0]
             even_div = min(candidates, key=lambda c: abs(raw_start - c))
-            if abs(raw_start - even_div) <= 0.62:
+            if abs(raw_start - even_div) <= 0.68:
                 start_div = even_div
 
         dur_div = max(1, int(round(n.duration_sec / div_sec)))
@@ -570,6 +587,18 @@ def _quantize_notes_to_grid(
             if prev["start_div"] + prev["dur_div"] > start_div:
                 prev["dur_div"] = max(1, start_div - prev["start_div"])
         grid_items.append({"start_div": start_div, "dur_div": dur_div, "note": n})
+
+    # Recover late-triggered 8th notes that landed on odd 16th slots leaving an empty preceding 16th rest.
+    for idx, item in enumerate(grid_items):
+        if item["start_div"] % 2 == 1 and item["dur_div"] == 1:
+            prev_item = grid_items[idx - 1] if idx > 0 else None
+            prev_start = prev_item["start_div"] if prev_item else -99
+            next_start = grid_items[idx + 1]["start_div"] if idx + 1 < len(grid_items) else None
+            if prev_start < item["start_div"] - 1 and next_start == item["start_div"] + 1:
+                if prev_item and prev_item["start_div"] + prev_item["dur_div"] > item["start_div"] - 1:
+                    prev_item["dur_div"] = max(1, (item["start_div"] - 1) - prev_item["start_div"])
+                item["start_div"] -= 1
+                item["dur_div"] = 2
 
     # Stabilize plucked 8th/quarter notes so acoustic decay does not fragment into 16th rests.
     for idx, item in enumerate(grid_items):
@@ -612,6 +641,7 @@ def _append_pitched_note(
     tie_start: bool = False,
     tie_stop: bool = False,
     use_flats: bool = False,
+    lyric_text: str | None = None,
 ) -> None:
     parts = _decompose_divisions(dur_div)
     step, alter = (_STEP_ALTER_FLAT if use_flats else _STEP_ALTER_SHARP)[note.pitch_midi % 12]
@@ -652,6 +682,104 @@ def _append_pitched_note(
                 ET.SubElement(technical, "string").text = str(note.string_num)
                 ET.SubElement(technical, "fret").text = str(note.fret)
 
+        if lyric_text and is_first and not tie_stop and not include_tab:
+            lyric_el = ET.SubElement(note_el, "lyric", {"number": "1"})
+            ET.SubElement(lyric_el, "syllabic").text = "single"
+            ET.SubElement(lyric_el, "text").text = lyric_text
+
+
+def _split_lyric_chunks(text: str, max_words: int = 3, max_chars: int = 18) -> list[str]:
+    words = text.strip().split()
+    if not words:
+        return []
+    if len(words) == 1 and len(words[0]) <= max_chars:
+        return words
+    chunks: list[str] = []
+    cur: list[str] = []
+    for word in words:
+        cand = " ".join([*cur, word])
+        if cur and (len(cur) >= max_words or len(cand) > max_chars):
+            chunks.append(" ".join(cur))
+            cur = [word]
+        else:
+            cur.append(word)
+    if cur:
+        chunks.append(" ".join(cur))
+    return chunks
+
+
+def _map_lyrics_to_grid(
+    grid_items: list[dict],
+    measure_div: int,
+    bpm: float,
+    lyrics: list | None,
+    time_shift_sec: float = 0.0,
+) -> dict[int, str]:
+    """Attach synced lyric chunks or plain lyric lines onto quantized note start_div positions."""
+    if not grid_items or not lyrics:
+        return {}
+
+    div_sec = (60.0 / max(bpm, 20.0)) / DIVISIONS_PER_QUARTER
+    synced: list[tuple[float, str]] = []
+    plain: list[str] = []
+    for entry in lyrics:
+        if isinstance(entry, str):
+            txt = entry.strip()
+            if txt:
+                plain.append(txt)
+        elif isinstance(entry, dict):
+            txt = str(entry.get("text") or "").strip()
+            if txt and "onset_sec" in entry and entry["onset_sec"] is not None:
+                synced.append((float(entry["onset_sec"]), txt))
+            elif txt:
+                plain.append(txt)
+        elif hasattr(entry, "text"):
+            txt = str(getattr(entry, "text") or "").strip()
+            onset = getattr(entry, "onset_sec", None)
+            if txt and onset is not None:
+                synced.append((float(onset), txt))
+            elif txt:
+                plain.append(txt)
+
+    assigned: dict[int, str] = {}
+    if synced:
+        synced.sort(key=lambda item: item[0])
+        last_assigned_idx = -1
+        lookahead_divs = max(8, int(round(3.0 / max(div_sec, 1e-4))))
+        for line_idx, (onset_sec, line_text) in enumerate(synced):
+            next_onset = synced[line_idx + 1][0] if line_idx + 1 < len(synced) else onset_sec + 4.0
+            span_sec = min(max(next_onset - onset_sec, 1.0), 5.0)
+            chunks = _split_lyric_chunks(line_text)
+            if not chunks:
+                continue
+            aligned_start = max(0.0, onset_sec - time_shift_sec)
+            for c_idx, chunk in enumerate(chunks):
+                t_chunk = aligned_start + (c_idx / len(chunks)) * span_sec
+                target_div = max(0, int(round(t_chunk / div_sec)))
+                best_idx: int | None = None
+                for g_idx in range(last_assigned_idx + 1, len(grid_items)):
+                    s_div = grid_items[g_idx]["start_div"]
+                    if s_div < target_div - 2:
+                        continue
+                    if s_div > target_div + lookahead_divs:
+                        break
+                    best_idx = g_idx
+                    break
+                if best_idx is not None:
+                    assigned[grid_items[best_idx]["start_div"]] = chunk
+                    last_assigned_idx = best_idx
+        return assigned
+
+    if plain:
+        per_measure_first: dict[int, int] = {}
+        for it in grid_items:
+            m_num = (it["start_div"] // measure_div) + 1
+            per_measure_first.setdefault(m_num, it["start_div"])
+        active_measures = sorted(per_measure_first)
+        for line_text, m_num in zip(plain, active_measures):
+            assigned[per_measure_first[m_num]] = line_text[:36]
+    return assigned
+
 
 def write_musicxml_score(
     notes: list[TabbedBassNote],
@@ -661,6 +789,8 @@ def write_musicxml_score(
     bpm: float = 120.0,
     string_count: int = 4,
     beats_per_measure: int = 4,
+    lyrics: list | None = None,
+    lyric_time_shift_sec: float = 0.0,
 ) -> Path:
     """Write a valid 2-staff (Bass Clef + 4/5-string TAB + Chord symbols) MusicXML 4.0 score."""
     strings = _strings_for_count(string_count)
@@ -670,6 +800,13 @@ def write_musicxml_score(
     total_measures = max(total_measures, max((c.measure_num for c in chords), default=0))
     key_fifths = infer_key_fifths(notes)
     use_flats = key_fifths < 0
+    lyric_by_start_div = _map_lyrics_to_grid(
+        grid_items,
+        measure_div=measure_div,
+        bpm=bpm,
+        lyrics=lyrics,
+        time_shift_sec=lyric_time_shift_sec,
+    )
 
     # Split notes cleanly across bar boundaries.
     per_measure: dict[int, list[tuple[int, int, TabbedBassNote, bool, bool]]] = {
@@ -770,6 +907,12 @@ def write_musicxml_score(
             for start_off, dur_div, note_obj, tie_start, tie_stop in events:
                 if start_off > cursor:
                     _append_rest(measure_el, start_off - cursor, staff_num)
+                global_div = (m_idx - 1) * measure_div + start_off
+                note_lyric = (
+                    lyric_by_start_div.get(global_div)
+                    if staff_num == 1 and not tie_stop
+                    else None
+                )
                 _append_pitched_note(
                     measure_el,
                     note_obj,
@@ -779,6 +922,7 @@ def write_musicxml_score(
                     tie_start=tie_start,
                     tie_stop=tie_stop,
                     use_flats=use_flats,
+                    lyric_text=note_lyric,
                 )
                 cursor = start_off + dur_div
             if cursor < measure_div:

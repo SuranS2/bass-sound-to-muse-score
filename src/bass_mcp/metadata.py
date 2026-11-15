@@ -6,11 +6,22 @@ import json
 import re
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from typing import Any
 
 from bass_mcp.security import SecurityValidationError
 
-_ALLOWED_API_HOSTS = frozenset({"itunes.apple.com", "api.deezer.com"})
+_ALLOWED_API_HOSTS = frozenset({"itunes.apple.com", "api.deezer.com", "lrclib.net"})
+_LRC_LINE_RE = re.compile(r"^((?:\[\d{1,3}:\d{2}(?:\.\d{1,3})?\])+)(.*)$")
+_LRC_TIME_RE = re.compile(r"\[(\d{1,3}):(\d{2})(?:\.(\d{1,3}))?\]")
+
+
+@dataclass(frozen=True)
+class LyricLine:
+    """Single timestamped lyric phrase aligned to song time in seconds."""
+
+    onset_sec: float
+    text: str
 _MAX_HTTP_BYTES = 512 * 1024
 _USER_AGENT = "bass-sound-to-muse-score/0.1 (local-mcp)"
 
@@ -160,3 +171,102 @@ def lookup_original_song_bpm(
         pass
 
     return result
+
+
+def parse_lrc_lyrics(lrc_text: str) -> list[LyricLine]:
+    """Parse LRC '[mm:ss.xx] text' lines into sorted LyricLine events."""
+    lines: list[LyricLine] = []
+    for raw_line in str(lrc_text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        match = _LRC_LINE_RE.match(line)
+        if not match:
+            continue
+        tags_part, text_part = match.groups()
+        clean_phrase = _clean_text(text_part, max_len=120)
+        if not clean_phrase or clean_phrase.startswith("[") and clean_phrase.endswith("]"):
+            continue
+        for mm_s, ss_s, frac_s in _LRC_TIME_RE.findall(tags_part):
+            sec = int(mm_s) * 60 + int(ss_s)
+            if frac_s:
+                sec += int(frac_s) / (10 ** len(frac_s))
+            lines.append(LyricLine(onset_sec=round(float(sec), 3), text=clean_phrase))
+    lines.sort(key=lambda item: item.onset_sec)
+    return lines
+
+
+def lookup_song_lyrics(
+    song_title: str,
+    artist: str = "",
+    duration_sec: float | None = None,
+    timeout_sec: float = 6.0,
+) -> dict[str, Any]:
+    """Fetch synced or plain lyrics from allowlisted lrclib.net when indexed."""
+    clean_title = _clean_text(song_title)
+    clean_artist = _clean_text(artist)
+    query = f"{clean_artist} {clean_title}".strip()
+    empty_res: dict[str, Any] = {
+        "found": False,
+        "synced_lines": [],
+        "plain_lines": [],
+        "canonical_artist": clean_artist or None,
+        "canonical_title": clean_title or None,
+        "source": None,
+    }
+    if not query:
+        return empty_res
+
+    encoded = urllib.parse.quote_plus(query)
+    try:
+        items = _fetch_allowlisted_json(
+            f"https://lrclib.net/api/search?q={encoded}",
+            timeout_sec=timeout_sec,
+        )
+    except (OSError, ValueError, json.JSONDecodeError, SecurityValidationError):
+        return empty_res
+
+    if not isinstance(items, list) or not items:
+        return empty_res
+
+    tokens = [
+        tok.lower()
+        for tok in re.split(r"[^0-9A-Za-z\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]+", query)
+        if len(tok) >= 2
+    ]
+    best_item: dict[str, Any] | None = None
+    best_score = -float("inf")
+    for item in items[:10]:
+        if not isinstance(item, dict):
+            continue
+        synced = str(item.get("syncedLyrics") or "").strip()
+        plain = str(item.get("plainLyrics") or "").strip()
+        if not synced and not plain:
+            continue
+        haystack = f"{item.get('trackName', '')} {item.get('artistName', '')}".lower()
+        score = 4.0 if synced else 1.0
+        score += sum(1.5 for tok in tokens if tok in haystack)
+        item_dur = item.get("duration")
+        if duration_sec and isinstance(item_dur, (int, float)) and item_dur > 0:
+            score -= min(4.0, abs(float(item_dur) - float(duration_sec)) / 10.0)
+        if score > best_score:
+            best_score = score
+            best_item = item
+
+    if not best_item:
+        return empty_res
+
+    synced_lines = parse_lrc_lyrics(str(best_item.get("syncedLyrics") or ""))
+    plain_lines = [
+        _clean_text(line, max_len=120)
+        for line in str(best_item.get("plainLyrics") or "").splitlines()
+        if _clean_text(line, max_len=120)
+    ]
+    return {
+        "found": bool(synced_lines or plain_lines),
+        "synced_lines": synced_lines,
+        "plain_lines": plain_lines,
+        "canonical_artist": _clean_text(str(best_item.get("artistName") or "")) or (clean_artist or None),
+        "canonical_title": _clean_text(str(best_item.get("trackName") or "")) or (clean_title or None),
+        "source": "lrclib:api",
+    }

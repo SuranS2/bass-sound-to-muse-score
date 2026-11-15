@@ -11,7 +11,9 @@ import pytest
 from bass_mcp.security import (
     SecurityValidationError,
     build_safe_env,
+    format_job_dir_name,
     prepare_job_output_dir,
+    rename_job_output_dir,
     run_safe_command,
     validate_input_audio_path,
     validate_youtube_url,
@@ -117,3 +119,19 @@ def test_subprocess_env_scrubs_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
         [sys.executable, "-c", "import os; print(os.environ.get('OPENAI_API_KEY', 'MISSING'))"]
     )
     assert proc.stdout.strip() == "MISSING"
+
+
+def test_format_and_rename_job_output_dir_sanitizes_and_preserves_root(tmp_path: Path) -> None:
+    name = format_job_dir_name(
+        song_title="Marry Me? ../evil",
+        artist="ELLEGARDEN / Band",
+        timestamp="20261115_230000",
+        short_id="ab12cd34",
+    )
+    assert name == "Marry_Me_evil-ELLEGARDEN_Band-20261115_230000-ab12cd34"
+
+    raw_dir = prepare_job_output_dir(tmp_path)
+    renamed = rename_job_output_dir(raw_dir, song_title="비밀곡", artist="가수")
+    assert renamed.parent == tmp_path.resolve()
+    assert renamed.is_dir()
+    assert renamed.name.startswith("비밀곡-가수-")

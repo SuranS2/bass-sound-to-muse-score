@@ -17,11 +17,12 @@ except ImportError:  # pragma: no cover - mcp 1.x fallback
     from mcp.server.fastmcp import FastMCP
 
 from bass_mcp.downloader import acquire_audio
-from bass_mcp.metadata import lookup_original_song_bpm, parse_song_artist
+from bass_mcp.metadata import lookup_original_song_bpm, lookup_song_lyrics, parse_song_artist
 from bass_mcp.musescore_bridge import MuseScoreBridge
 from bass_mcp.score_builder import (
     TabbedBassNote,
     assign_bass_tab_positions,
+    compute_onset_shift_sec,
     convert_with_musescore_cli,
     find_musescore_binary,
     infer_measure_chords,
@@ -35,6 +36,7 @@ from bass_mcp.security import (
     parse_allowed_dirs,
     is_uri_input,
     prepare_job_output_dir,
+    rename_job_output_dir,
     validate_input_audio_path,
     validate_input_file_path,
 )
@@ -97,7 +99,9 @@ def _build_score_artifacts(
     title: str,
     bpm: float,
     string_count: int,
+    lyrics: list[Any] | None = None,
 ) -> dict[str, Any]:
+    shift_sec = compute_onset_shift_sec(notes, bpm=bpm, preserve_intro_bars=True)
     aligned_notes = normalize_note_onsets(notes, bpm=bpm, preserve_intro_bars=True)
     tabbed = assign_bass_tab_positions(aligned_notes, string_count=string_count)
     chords = infer_measure_chords(tabbed, bpm=bpm)
@@ -110,6 +114,8 @@ def _build_score_artifacts(
         title=title,
         bpm=bpm,
         string_count=string_count,
+        lyrics=lyrics,
+        lyric_time_shift_sec=shift_sec,
     )
     ascii_tab = render_ascii_bass_tab(tabbed, chords, bpm=bpm, string_count=string_count)
     mscz_path = convert_with_musescore_cli(musicxml_path, output_format="mscz")
@@ -130,9 +136,79 @@ def _resolve_song_metadata(acq: dict[str, Any], requested_title: str) -> tuple[d
         meta = parse_song_artist(raw_title=str(acq.get("id") or requested_title))
     if requested_title.strip() and requested_title.strip() != "Bass Score":
         effective = _sanitize_title(requested_title)
+        parsed_req = parse_song_artist(raw_title=effective)
+        if not meta.get("song_title") or meta.get("song_title") == str(acq.get("id")):
+            meta["song_title"] = parsed_req.get("song_title") or effective
+        if not meta.get("artist") and parsed_req.get("artist"):
+            meta["artist"] = parsed_req["artist"]
     else:
         effective = _sanitize_title(meta.get("display_name") or requested_title)
     return meta, effective
+
+
+def _find_sibling_yt_metadata(audio_path: Path) -> dict[str, str] | None:
+    """Inspect parent folders up to 4 levels for yt_download*.info.json metadata."""
+    cur = audio_path.resolve().parent
+    for _ in range(4):
+        for info_path in sorted(cur.glob("yt_download*.info.json")):
+            if info_path.is_symlink() or not info_path.is_file():
+                continue
+            if info_path.stat().st_size > 5 * 1024 * 1024:
+                continue
+            try:
+                payload = json.loads(info_path.read_text(encoding="utf-8", errors="replace"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(payload, dict):
+                return parse_song_artist(
+                    raw_title=str(payload.get("title") or ""),
+                    uploader=str(payload.get("uploader") or payload.get("channel") or ""),
+                    track=str(payload.get("track") or ""),
+                    artist=str(payload.get("artist") or ""),
+                )
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+    return None
+
+
+def _resolve_lyrics_and_naming(
+    song_title: str,
+    artist: str,
+    duration_sec: float | None,
+) -> tuple[str, str, list[Any]]:
+    """Fetch lyrics via LRCLIB and return canonical (song_title, artist, lyrics_lines)."""
+    clean_title = song_title.strip()
+    clean_artist = artist.strip()
+    if not clean_title or clean_title == "Bass Score":
+        return clean_title, clean_artist, []
+    lyrics_res = lookup_song_lyrics(
+        song_title=clean_title,
+        artist=clean_artist,
+        duration_sec=duration_sec,
+    )
+    if not lyrics_res.get("found"):
+        return clean_title, clean_artist, []
+    canon_title = str(lyrics_res.get("canonical_title") or clean_title)
+    canon_artist = str(lyrics_res.get("canonical_artist") or clean_artist)
+    lines = lyrics_res.get("synced_lines") or lyrics_res.get("plain_lines") or []
+    return canon_title, canon_artist, lines
+
+
+def _rebase_job_dir(
+    job_dir: Path,
+    song_title: str,
+    artist: str,
+    *path_refs: tuple[dict[str, Any], str],
+) -> Path:
+    """Rename job_dir using song/artist metadata and update dependent file paths."""
+    if not song_title and not artist:
+        return job_dir
+    new_dir = rename_job_output_dir(job_dir, song_title=song_title, artist=artist)
+    if new_dir != job_dir:
+        for container, key in path_refs:
+            container[key] = new_dir / Path(container[key]).relative_to(job_dir)
+    return new_dir
 
 
 @mcp.tool()
@@ -162,6 +238,10 @@ async def transcribe_bass_pipeline(
 
     acq = acquire_audio(source=source, job_dir=job_dir)
     song_meta, safe_title = _resolve_song_metadata(acq, title)
+    meta_song = song_meta.get("song_title") or (safe_title if safe_title != "Bass Score" else "")
+    meta_artist = song_meta.get("artist") or ""
+    job_dir = _rebase_job_dir(job_dir, meta_song, meta_artist, (acq, "wav_path"))
+
     sep = separate_bass_stem(acq["wav_path"], job_dir=job_dir, method=separation_method)
     trans = transcribe_bass_notes(sep["bass_wav"], min_midi=min_midi, bpm_hint=bpm)
 
@@ -176,6 +256,9 @@ async def transcribe_bass_pipeline(
             f"{canonical_artist} - {canonical_title}"
             if canonical_artist and canonical_title
             else safe_title
+        )
+        job_dir = _rebase_job_dir(
+            job_dir, canonical_title, canonical_artist, (acq, "wav_path"), (sep, "bass_wav")
         )
         suggested_bpm = web_lookup["bpm"] if web_lookup.get("bpm") else trans["estimated_bpm"]
         return {
@@ -219,6 +302,15 @@ async def transcribe_bass_pipeline(
             ),
         }
 
+    canon_song, canon_artist, lyric_lines = _resolve_lyrics_and_naming(
+        song_title=meta_song,
+        artist=meta_artist,
+        duration_sec=acq["duration_sec"],
+    )
+    job_dir = _rebase_job_dir(
+        job_dir, canon_song, canon_artist, (acq, "wav_path"), (sep, "bass_wav")
+    )
+
     effective_bpm = float(bpm) if bpm and bpm > 0 else float(trans["estimated_bpm"])
     scored = _build_score_artifacts(
         notes=trans["notes"],
@@ -226,6 +318,7 @@ async def transcribe_bass_pipeline(
         title=safe_title,
         bpm=effective_bpm,
         string_count=string_count,
+        lyrics=lyric_lines,
     )
 
     push_result: dict[str, Any] | None = None
@@ -256,6 +349,7 @@ async def transcribe_bass_pipeline(
             "mscz": str(scored["mscz_path"]) if scored["mscz_path"] else None,
         },
         "note_count": len(tabbed),
+        "lyrics_count": len(lyric_lines),
         "chords": scored["chords"],
         "ascii_tab": scored["ascii_tab"],
         "notes_preview": [
@@ -278,6 +372,10 @@ def separate_bass_track(source: str, method: str = "auto") -> dict[str, Any]:
     """Download or load audio and isolate only the bass stem WAV."""
     job_dir = prepare_job_output_dir(_get_output_root())
     acq = acquire_audio(source=source, job_dir=job_dir)
+    meta = dict(acq.get("song_metadata") or {})
+    job_dir = _rebase_job_dir(
+        job_dir, meta.get("song_title") or "", meta.get("artist") or "", (acq, "wav_path")
+    )
     sep = separate_bass_stem(acq["wav_path"], job_dir=job_dir, method=method)
     return {
         "status": "ok",
@@ -302,13 +400,27 @@ def audio_to_bass_score(
     if is_uri_input(audio_path):
         raise SecurityValidationError("audio_to_bass_score accepts local file paths only, not URLs.")
     allowed_dirs = _effective_allowed_dirs()
-    validate_input_audio_path(audio_path, allowed_dirs=allowed_dirs)
+    resolved_audio = validate_input_audio_path(audio_path, allowed_dirs=allowed_dirs)
 
     safe_title = _sanitize_title(title)
     min_midi = _min_midi_for_strings(string_count)
-    job_dir = prepare_job_output_dir(_get_output_root())
+    sibling_meta = _find_sibling_yt_metadata(resolved_audio) or {}
+    parsed_title = parse_song_artist(raw_title=safe_title) if safe_title != "Bass Score" else {}
+    init_song = (parsed_title.get("song_title") or sibling_meta.get("song_title") or "").strip()
+    init_artist = (parsed_title.get("artist") or sibling_meta.get("artist") or "").strip()
+    if safe_title == "Bass Score" and sibling_meta.get("display_name"):
+        safe_title = _sanitize_title(sibling_meta["display_name"])
+
+    job_dir = prepare_job_output_dir(_get_output_root(), song_title=init_song, artist=init_artist)
 
     acq = acquire_audio(source=audio_path, job_dir=job_dir, allowed_dirs=allowed_dirs)
+    canon_song, canon_artist, lyric_lines = _resolve_lyrics_and_naming(
+        song_title=init_song or sibling_meta.get("song_title") or "",
+        artist=init_artist or sibling_meta.get("artist") or "",
+        duration_sec=acq["duration_sec"],
+    )
+    job_dir = _rebase_job_dir(job_dir, canon_song, canon_artist, (acq, "wav_path"))
+
     trans = transcribe_bass_notes(acq["wav_path"], min_midi=min_midi, bpm_hint=bpm)
     effective_bpm = float(bpm) if bpm and bpm > 0 else float(trans["estimated_bpm"])
     scored = _build_score_artifacts(
@@ -317,6 +429,7 @@ def audio_to_bass_score(
         title=safe_title,
         bpm=effective_bpm,
         string_count=string_count,
+        lyrics=lyric_lines,
     )
     tabbed: list[TabbedBassNote] = scored["tabbed_notes"]
 
@@ -334,6 +447,7 @@ def audio_to_bass_score(
             "mscz": str(scored["mscz_path"]) if scored["mscz_path"] else None,
         },
         "note_count": len(tabbed),
+        "lyrics_count": len(lyric_lines),
         "chords": scored["chords"],
         "ascii_tab": scored["ascii_tab"],
     }

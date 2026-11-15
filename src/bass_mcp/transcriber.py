@@ -134,6 +134,68 @@ def _yin_pitch_frame(frame: np.ndarray, sr: int, tau_min: int, tau_max: int, thr
     return float(sr) / max(tau_refined, 1.0)
 
 
+def _suppress_semitone_wobble(
+    smoothed: np.ndarray,
+    min_midi: int,
+    max_midi: int,
+    onset_frames: set[int] | None = None,
+) -> np.ndarray:
+    """Collapse short +-1 semitone attack/release glitches into adjacent steady pitches."""
+    runs: list[list[int]] = []
+    n = len(smoothed)
+    idx = 0
+    while idx < n:
+        p = int(smoothed[idx])
+        if min_midi <= p <= max_midi:
+            end = idx + 1
+            while end < n and int(smoothed[end]) == p:
+                end += 1
+            runs.append([idx, end, p])
+            idx = end
+        else:
+            idx += 1
+
+    if len(runs) < 2:
+        return smoothed
+
+    # Pass 1: snap <=7-frame (~81ms) semitone glitches attached directly to steady notes (>=8 frames).
+    for r_i, (start, end, pitch) in enumerate(runs):
+        length = end - start
+        if length > 7:
+            continue
+        target: int | None = None
+        if r_i > 0:
+            l_start, l_end, l_pitch = runs[r_i - 1]
+            no_onset_split = onset_frames is None or start not in onset_frames
+            if l_end == start and (l_end - l_start) >= 8 and abs(pitch - l_pitch) == 1 and no_onset_split:
+                target = l_pitch
+        if target is None and r_i + 1 < len(runs):
+            n_start, n_end, n_pitch = runs[r_i + 1]
+            no_onset_split = onset_frames is None or n_start not in onset_frames
+            if end == n_start and (n_end - n_start) >= 8 and abs(pitch - n_pitch) == 1:
+                nearby_same = sum(
+                    1 for j in range(max(0, r_i - 2), min(len(runs), r_i + 4)) if j != r_i and runs[j][2] == n_pitch
+                )
+                if no_onset_split or nearby_same >= 2:
+                    target = n_pitch
+        if target is not None:
+            smoothed[start:end] = target
+            runs[r_i][2] = target
+
+    # Pass 2: remove <=6-frame (~70ms) semitone dips sandwiched between repeated identical pitches.
+    for r_i in range(1, len(runs) - 1):
+        start, end, pitch = runs[r_i]
+        if (end - start) > 6:
+            continue
+        _, l_end, l_pitch = runs[r_i - 1]
+        n_start, _, n_pitch = runs[r_i + 1]
+        if l_pitch == n_pitch and abs(pitch - l_pitch) == 1 and (start - l_end) <= 2 and (n_start - end) <= 2:
+            smoothed[start:end] = l_pitch
+            runs[r_i][2] = l_pitch
+
+    return smoothed
+
+
 def _segments_from_frame_pitches(
     midi_frames: np.ndarray,
     rms_frames: np.ndarray,
@@ -157,6 +219,8 @@ def _segments_from_frame_pitches(
             if len(window) >= 2:
                 window.sort()
                 smoothed[idx] = window[len(window) // 2]
+
+    smoothed = _suppress_semitone_wobble(smoothed, min_midi, max_midi, onset_frames)
 
     peak_rms = float(np.max(rms_frames)) if len(rms_frames) else 1.0
     notes: list[BassNote] = []
@@ -321,6 +385,7 @@ def _transcribe_librosa_pyin(
     min_midi: int,
     max_midi: int,
     min_note_len_sec: float,
+    bpm_hint: float | None = None,
 ) -> list[BassNote]:
     import librosa
 
@@ -334,10 +399,16 @@ def _transcribe_librosa_pyin(
         hop_length=hop,
     )
     rms = librosa.feature.rms(y=audio, frame_length=1024, hop_length=hop)[0]
+    fast_tempo = bpm_hint is not None and bpm_hint >= 145.0
     onset_frames = {
         int(x)
         for x in librosa.onset.onset_detect(
-            y=audio, sr=sr, hop_length=hop, backtrack=False, delta=0.03, wait=4
+            y=audio,
+            sr=sr,
+            hop_length=hop,
+            backtrack=False,
+            delta=0.045 if fast_tempo else 0.03,
+            wait=6 if fast_tempo else 4,
         )
     }
     n = min(len(f0), len(rms))
@@ -380,16 +451,50 @@ def _clean_transcribed_notes(notes: list[BassNote], min_velocity: int = 66) -> l
             continue
         filtered.append(n)
 
+    filtered.sort(key=lambda item: item.onset_sec)
+    # Snap short <=100ms +-1 semitone attack/release glitches to surrounding repeated pitches.
+    for idx in range(len(filtered)):
+        cur = filtered[idx]
+        if cur.duration_sec > 0.10:
+            continue
+        neighbors = [filtered[j].pitch_midi for j in range(max(0, idx - 2), min(len(filtered), idx + 3)) if j != idx]
+        for target_p in set(neighbors):
+            if abs(cur.pitch_midi - target_p) == 1 and neighbors.count(target_p) >= 2:
+                prev_ok = (
+                    idx > 0
+                    and filtered[idx - 1].pitch_midi == target_p
+                    and (cur.onset_sec - (filtered[idx - 1].onset_sec + filtered[idx - 1].duration_sec)) <= 0.025
+                )
+                next_ok = (
+                    idx + 1 < len(filtered)
+                    and filtered[idx + 1].pitch_midi == target_p
+                    and (filtered[idx + 1].onset_sec - (cur.onset_sec + cur.duration_sec)) <= 0.025
+                )
+                if prev_ok or next_ok:
+                    filtered[idx] = BassNote(
+                        pitch_midi=target_p,
+                        note_name=midi_to_note_name(target_p),
+                        onset_sec=cur.onset_sec,
+                        duration_sec=cur.duration_sec,
+                        velocity=cur.velocity,
+                        pitch_bend=cur.pitch_bend,
+                    )
+                    break
+
     merged: list[BassNote] = []
-    for cur in sorted(filtered, key=lambda item: item.onset_sec):
+    for cur in filtered:
         if merged:
             prev = merged[-1]
             gap = cur.onset_sec - (prev.onset_sec + prev.duration_sec)
-            if (
-                cur.pitch_midi == prev.pitch_midi
-                and gap <= 0.045
-                and (cur.onset_sec - prev.onset_sec) < 0.09
-            ):
+            same_pitch = cur.pitch_midi == prev.pitch_midi
+            is_micro_split = same_pitch and gap <= 0.045 and (cur.onset_sec - prev.onset_sec) < 0.09
+            is_glitch_split = (
+                same_pitch
+                and gap <= 0.015
+                and min(prev.duration_sec, cur.duration_sec) <= 0.095
+                and (cur.onset_sec + cur.duration_sec - prev.onset_sec) <= 0.24
+            )
+            if is_micro_split or is_glitch_split:
                 new_end = max(prev.onset_sec + prev.duration_sec, cur.onset_sec + cur.duration_sec)
                 merged[-1] = BassNote(
                     pitch_midi=prev.pitch_midi,
@@ -488,7 +593,9 @@ def transcribe_bass_notes(
         notes = _transcribe_basic_pitch(bass_wav, min_midi, max_midi, min_note_len_sec)
         engine = "spotify:basic-pitch"
     elif has_librosa():
-        notes = _transcribe_librosa_pyin(bass_wav, min_midi, max_midi, min_note_len_sec)
+        notes = _transcribe_librosa_pyin(
+            bass_wav, min_midi, max_midi, min_note_len_sec, bpm_hint=bpm_hint
+        )
         engine = "librosa:pyin"
     else:
         notes = _transcribe_builtin_yin(bass_wav, min_midi, max_midi, min_note_len_sec)

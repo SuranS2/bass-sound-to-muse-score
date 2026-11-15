@@ -25,7 +25,9 @@ MAX_AUDIO_FILE_BYTES = 200 * 1024 * 1024
 MAX_URL_LENGTH = 2048
 
 _VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
-_JOB_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_JOB_ID_RE = re.compile(r"^[0-9A-Za-z\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af_-]{1,120}$")
+_SAFE_SLUG_STRIP_RE = re.compile(r"[^0-9A-Za-z\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]+")
+_JOB_SUFFIX_RE = re.compile(r"^(?:.+[-_])?(\d{8}_\d{6})[-_]([0-9a-fA-F]{8})$")
 _URI_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
 _WINDOWS_RESERVED_NAMES = frozenset(
@@ -201,17 +203,60 @@ def validate_input_audio_path(
     )
 
 
-def prepare_job_output_dir(base_output_dir: Path, job_id: str | None = None) -> Path:
+def _slugify_label(value: str, max_len: int) -> str:
+    cleaned = _SAFE_SLUG_STRIP_RE.sub("_", str(value or "")).strip("_-")
+    if len(cleaned) > max_len:
+        cleaned = cleaned[:max_len].rstrip("_-")
+    return cleaned
+
+
+def format_job_dir_name(
+    song_title: str = "",
+    artist: str = "",
+    timestamp: str | None = None,
+    short_id: str | None = None,
+) -> str:
+    """Build a filesystem-safe directory name as '<song>-<artist>-<YYYYMMDD_HHMMSS>-<id>'."""
+    ts = timestamp if timestamp and re.fullmatch(r"\d{8}_\d{6}", timestamp) else time.strftime("%Y%m%d_%H%M%S")
+    uid = short_id if short_id and re.fullmatch(r"[0-9a-fA-F]{8}", short_id) else uuid.uuid4().hex[:8]
+
+    clean_title = _slugify_label(song_title, 36)
+    clean_artist = _slugify_label(artist, 24)
+    if clean_title and clean_artist and clean_artist.lower() != clean_title.lower():
+        prefix = f"{clean_title}-{clean_artist}"
+    elif clean_title:
+        prefix = clean_title
+    elif clean_artist:
+        prefix = clean_artist
+    else:
+        prefix = "job"
+
+    candidate = f"{prefix}-{ts}-{uid}"
+    _check_not_windows_device_name(candidate, "job_id")
+    if not _JOB_ID_RE.fullmatch(candidate):
+        return f"job-{ts}-{uid}"
+    return candidate
+
+
+def prepare_job_output_dir(
+    base_output_dir: Path,
+    job_id: str | None = None,
+    song_title: str = "",
+    artist: str = "",
+) -> Path:
     """Create and return an isolated job subdirectory strictly under base_output_dir."""
     base = Path(base_output_dir).resolve()
     base.mkdir(parents=True, exist_ok=True)
 
     if job_id is None:
-        safe_id = f"job_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+        if song_title.strip() or artist.strip():
+            safe_id = format_job_dir_name(song_title=song_title, artist=artist)
+        else:
+            safe_id = f"job-{time.strftime('%Y%m%d_%H%M%S')}-{uuid.uuid4().hex[:8]}"
     else:
         safe_id = _check_no_control_chars(job_id, "job_id")
         if not _JOB_ID_RE.fullmatch(safe_id):
-            raise SecurityValidationError("job_id must match ^[A-Za-z0-9_-]{1,64}$.")
+            raise SecurityValidationError("job_id contains disallowed characters or length.")
         _check_not_windows_device_name(safe_id, "job_id")
 
     job_dir = (base / safe_id).resolve()
@@ -219,6 +264,35 @@ def prepare_job_output_dir(base_output_dir: Path, job_id: str | None = None) -> 
         raise SecurityValidationError("Resolved job directory escaped base output directory.")
     job_dir.mkdir(parents=True, exist_ok=True)
     return job_dir
+
+
+def rename_job_output_dir(
+    job_dir: Path,
+    song_title: str = "",
+    artist: str = "",
+) -> Path:
+    """Safely rename an existing job subdirectory once song/artist metadata is known."""
+    resolved = Path(job_dir).resolve()
+    if not resolved.is_dir():
+        return resolved
+    base = resolved.parent.resolve()
+    if resolved == base or not resolved.is_relative_to(base):
+        raise SecurityValidationError("Resolved job directory escaped base output directory.")
+
+    match = _JOB_SUFFIX_RE.fullmatch(resolved.name)
+    ts = match.group(1) if match else None
+    uid = match.group(2) if match else None
+    new_name = format_job_dir_name(song_title=song_title, artist=artist, timestamp=ts, short_id=uid)
+    target = (base / new_name).resolve()
+    if target == base or not target.is_relative_to(base):
+        raise SecurityValidationError("Renamed job directory escaped base output directory.")
+    if target == resolved:
+        return resolved
+    if target.exists():
+        new_name = format_job_dir_name(song_title=song_title, artist=artist, timestamp=ts, short_id=uuid.uuid4().hex[:8])
+        target = (base / new_name).resolve()
+    resolved.rename(target)
+    return target
 
 
 def build_safe_env(extra_env: dict[str, str] | None = None) -> dict[str, str]:

@@ -208,3 +208,47 @@ def test_two_tap_16th_double_hits_preserved() -> None:
     cleaned = _clean_transcribed_notes(notes, min_velocity=62)
     assert len(cleaned) == 3
     assert [round(n.onset_sec, 3) for n in cleaned] == [1.0, 1.132, 2.0]
+
+
+def test_parse_lrc_lyrics_and_semitone_wobble_suppression(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from bass_mcp.metadata import parse_lrc_lyrics
+    from bass_mcp.transcriber import _segments_from_frame_pitches
+
+    lines = parse_lrc_lyrics("[00:10.88] I am standing in the line\n[00:16.34] Shining like the sun\n")
+    assert len(lines) == 2
+    assert lines[0].onset_sec == 10.88
+    assert lines[0].text == "I am standing in the line"
+
+    # Simulate an alternating A1(33) bass line with a brief 5-frame G#1(32) attack dip.
+    midi = np.array([33] * 14 + [32] * 4 + [33] * 14, dtype=np.int32)
+    rms = np.full(len(midi), 0.5, dtype=np.float32)
+    segs = _segments_from_frame_pitches(
+        midi_frames=midi,
+        rms_frames=rms,
+        hop_sec=256 / 22050.0,
+        min_midi=28,
+        max_midi=67,
+        min_note_len_sec=0.06,
+    )
+    assert all(n.pitch_midi == 33 for n in segs)
+
+    out_root = tmp_path / "mcp_output"
+    monkeypatch.setenv("BASS_MCP_OUTPUT_DIR", str(out_root))
+    monkeypatch.setattr(
+        "bass_mcp.server.lookup_song_lyrics",
+        lambda song_title, artist="", duration_sec=None: {
+            "found": True,
+            "synced_lines": lines,
+            "plain_lines": [],
+            "canonical_artist": "ELLEGARDEN",
+            "canonical_title": "Marry Me",
+            "source": "mock:lrclib",
+        },
+    )
+    wav_path = _synthesize_bass_riff_wav(tmp_path / "raw.wav")
+    res = audio_to_bass_score(audio_path=str(wav_path), title="Marry Me - ELLEGARDEN", bpm=120.0)
+    assert Path(res["job_dir"]).name.startswith("Marry_Me-ELLEGARDEN-")
+    assert res["lyrics_count"] == 2
