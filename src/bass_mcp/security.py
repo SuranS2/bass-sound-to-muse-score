@@ -129,7 +129,7 @@ def validate_youtube_url(url: str) -> tuple[str, str]:
     return video_id, f"https://www.youtube.com/watch?v={video_id}"
 
 
-def _parse_allowed_dirs(allowed_dirs: list[Path] | None) -> list[Path]:
+def parse_allowed_dirs(allowed_dirs: list[Path] | None = None) -> list[Path]:
     if allowed_dirs is not None:
         return [Path(d).resolve() for d in allowed_dirs]
     env_dirs = os.environ.get("BASS_MCP_ALLOWED_DIRS", "").strip()
@@ -138,12 +138,15 @@ def _parse_allowed_dirs(allowed_dirs: list[Path] | None) -> list[Path]:
     return [Path(p).resolve() for p in env_dirs.split(os.pathsep) if p.strip()]
 
 
-def validate_input_audio_path(
+def validate_input_file_path(
     file_path: str,
+    allowed_extensions: frozenset[str],
+    max_bytes: int,
     allowed_dirs: list[Path] | None = None,
+    label: str = "File",
 ) -> Path:
-    """Validate a local audio path against traversal, symlinks, devices, and size limits."""
-    cleaned = _check_no_control_chars(file_path, "Audio path")
+    """Validate a local input path against traversal, symlinks, devices, and size limits."""
+    cleaned = _check_no_control_chars(file_path, f"{label} path")
     if is_uri_input(cleaned):
         raise SecurityValidationError("URI schemes are not accepted as local file paths.")
     if cleaned.startswith("\\\\") or cleaned.startswith("//"):
@@ -151,37 +154,51 @@ def validate_input_audio_path(
 
     raw = Path(cleaned)
     for part in raw.parts:
-        _check_not_windows_device_name(part, "Audio path component")
+        _check_not_windows_device_name(part, f"{label} path component")
 
     if raw.is_symlink():
-        raise SecurityValidationError("Symbolic links are not permitted as audio input.")
+        raise SecurityValidationError(f"Symbolic links are not permitted as {label.lower()} input.")
 
     try:
         resolved = raw.resolve(strict=True)
     except OSError as exc:
-        raise SecurityValidationError(f"Audio file does not exist or cannot be resolved: {cleaned}") from exc
+        raise SecurityValidationError(f"{label} file does not exist or cannot be resolved: {cleaned}") from exc
 
-    _check_not_windows_device_name(resolved.name, "Resolved audio filename")
+    _check_not_windows_device_name(resolved.name, f"Resolved {label.lower()} filename")
     if resolved.is_symlink():
-        raise SecurityValidationError("Resolved audio path must not be a symlink.")
+        raise SecurityValidationError(f"Resolved {label.lower()} path must not be a symlink.")
 
     st = resolved.stat()
     if not stat.S_ISREG(st.st_mode):
-        raise SecurityValidationError("Audio path must point to a regular file.")
-    if resolved.suffix.lower() not in ALLOWED_AUDIO_EXTENSIONS:
+        raise SecurityValidationError(f"{label} path must point to a regular file.")
+    if resolved.suffix.lower() not in allowed_extensions:
         raise SecurityValidationError(
-            f"Unsupported audio extension '{resolved.suffix}'. Allowed: {sorted(ALLOWED_AUDIO_EXTENSIONS)}"
+            f"Unsupported extension '{resolved.suffix}'. Allowed: {sorted(allowed_extensions)}"
         )
-    if st.st_size <= 0 or st.st_size > MAX_AUDIO_FILE_BYTES:
+    if st.st_size <= 0 or st.st_size > max_bytes:
         raise SecurityValidationError(
-            f"Audio file size ({st.st_size} bytes) must be between 1 byte and {MAX_AUDIO_FILE_BYTES} bytes."
+            f"{label} file size ({st.st_size} bytes) must be between 1 byte and {max_bytes} bytes."
         )
 
-    effective_dirs = _parse_allowed_dirs(allowed_dirs)
+    effective_dirs = parse_allowed_dirs(allowed_dirs)
     if effective_dirs and not any(resolved.is_relative_to(d) for d in effective_dirs):
-        raise SecurityValidationError("Audio file lies outside configured allowed directories.")
+        raise SecurityValidationError(f"{label} file lies outside configured allowed directories.")
 
     return resolved
+
+
+def validate_input_audio_path(
+    file_path: str,
+    allowed_dirs: list[Path] | None = None,
+) -> Path:
+    """Validate a local audio path against traversal, symlinks, devices, and size limits."""
+    return validate_input_file_path(
+        file_path=file_path,
+        allowed_extensions=ALLOWED_AUDIO_EXTENSIONS,
+        max_bytes=MAX_AUDIO_FILE_BYTES,
+        allowed_dirs=allowed_dirs,
+        label="Audio",
+    )
 
 
 def prepare_job_output_dir(base_output_dir: Path, job_id: str | None = None) -> Path:
