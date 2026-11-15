@@ -30,29 +30,65 @@
 
 ---
 
-## 설치 방법
+## 초보자용 빠른 설치 가이드 (Step-by-Step)
 
-### 1. 기본 설치 (경량/즉시 실행 — 내장 필터 + YIN + MIDI/MusicXML 포함)
+### 0단계. 사전 준비물 설치
+터미널(Windows PowerShell 또는 macOS 터미널)에서 아래 필수 프로그램을 먼저 설치합니다.
+
+- **Python 3.10 ~ 3.12** (Python 3.12 권장)
+  - Windows: `winget install Python.Python.3.12`
+  - macOS: `brew install python@3.12`
+- **FFmpeg** (유튜브 음원·MP3·M4A 변환 필수)
+  - Windows: `winget install Gyan.FFmpeg` (설치 후 터미널을 재시작하세요)
+  - macOS: `brew install ffmpeg`
+- **(선택) MuseScore 4** (`.musicxml`을 MuseScore 전용 `.mscz` 파일로 자동 변환할 때 필요)
+  - Windows: `winget install MuseScore.MuseScore`
+  - macOS: `brew install --cask musescore`
+
+### 1단계. 저장소 내려받기 및 가상환경 설치
+
+> **주의:** `pip install`은 반드시 이 프로젝트 폴더(`bass-sound-to-muse-score`) 안으로 `cd`한 뒤에 실행하세요.
+
 ```powershell
+git clone https://github.com/SuranS2/bass-sound-to-muse-score.git
+cd bass-sound-to-muse-score
+
+# 가상환경(.venv) 생성 및 고품질 ML 엔진(Demucs + Librosa pYIN) 설치
 python -m venv .venv
-.venv\Scripts\pip install -e .
-```
-
-### 2. 고품질 ML 엔진 포함 설치 (Demucs + Librosa pYIN / Python 3.10~3.11에서는 Basic Pitch 포함)
-> 참고: `ffmpeg`가 시스템 `PATH`에 설치되어 있어야 유튜브/MP3/M4A 변환이 가능합니다. Python 3.12+ 환경에서는 TensorFlow 미지원으로 `basic-pitch`가 자동 제외되며 `demucs` + `librosa:pyin` 엔진이 동작합니다.
-```powershell
 .venv\Scripts\pip install -e ".[ml]"
 ```
 
-### 3. (선택) MuseScore 4 실시간 연동 플러그인
+*(macOS / Linux에서는 마지막 줄 대신 `.venv/bin/pip install -e ".[ml]"`를 사용하세요. 가벼운 기본 모드만 필요하면 `-e .`로 설치할 수 있으며, Python 3.10~3.11에서는 `basic-pitch`도 함께 설치되고 Python 3.12+에서는 자동으로 `demucs` + `librosa:pyin` 엔진으로 동작합니다.)*
+
+### 2단계. (선택) MuseScore 4 실시간 연동 플러그인
 1. [`plugins/musescore-mcp-websocket.qml`](plugins/musescore-mcp-websocket.qml) 파일을 `%USERPROFILE%\Documents\MuseScore4\Plugins\` 폴더에 복사합니다.
-2. MuseScore 4 → **Plugins → Plugin Manager**에서 활성화한 뒤 실행합니다 (`ws://127.0.0.1:8765`).
+2. MuseScore 4 → **Plugins → Plugin Manager**에서 활성화한 뒤 실행합니다 (`ws://127.0.0.1:8765`, 로컬 루프백 전용).
 
 ---
 
-## MCP 클라이언트 연동 설정 (`mcp_config.example.json`)
+## AI 툴별 MCP 서버 등록 방법 (복사·붙여넣기용)
 
-Claude Desktop, Cursor, Claude Code, Gemini CLI 등의 MCP 설정 파일에 아래 항목을 추가하세요.
+아래 예시의 `C:\\dev\\bass-sound-to-muse-score` 경로만 **본인이 `git clone`한 실제 폴더 경로**로 바꿔 넣은 뒤, 해당 AI 툴을 **재시작**하세요.
+
+### 1. OpenAI Codex (CLI / Desktop / VS Code 확장)
+Codex는 JSON이 아닌 **TOML 문법**을 사용합니다.
+- **설정 파일 위치:**
+  - Windows: `C:\Users\<사용자이름>\.codex\config.toml`
+  - macOS / Linux: `~/.codex/config.toml`
+
+```toml
+[mcp_servers.bass-sound-to-musescore]
+command = "C:\\dev\\bass-sound-to-muse-score\\.venv\\Scripts\\python.exe"
+args = ["-m", "bass_mcp"]
+
+[mcp_servers.bass-sound-to-musescore.env]
+BASS_MCP_OUTPUT_DIR = "C:\\dev\\bass-sound-to-muse-score\\output"
+```
+
+### 2. Claude Desktop (클로드 데스크톱 앱)
+- **설정 파일 위치:**
+  - Windows: `%APPDATA%\Claude\claude_desktop_config.json` (주소창에 붙여넣기 가능)
+  - macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
 
 ```json
 {
@@ -68,7 +104,47 @@ Claude Desktop, Cursor, Claude Code, Gemini CLI 등의 MCP 설정 파일에 아�
 }
 ```
 
-(선택 보안 옵션: `BASS_MCP_ALLOWED_DIRS` 환경변수에 `;`로 구분된 허용 폴더를 지정하면 해당 폴더 밖의 로컬 음원 접근을 차단합니다.)
+### 3. Claude Code (CLI)
+터미널에서 아래 한 줄을 실행하면 바로 등록됩니다.
+```powershell
+claude mcp add --transport stdio bass-sound-to-musescore -e BASS_MCP_OUTPUT_DIR=C:\dev\bass-sound-to-muse-score\output -- C:\dev\bass-sound-to-muse-score\.venv\Scripts\python.exe -m bass_mcp
+```
+
+### 4. Google Antigravity (AGY) & Cursor
+- **Google Antigravity 설정 파일 위치:**
+  - 전역: `C:\Users\<사용자이름>\.gemini\antigravity\mcp_config.json` (또는 `~/.gemini/config/mcp_config.json`)
+  - 프로젝트별: `.agents/mcp_config.json`
+- **Cursor 설정 파일 위치:** `C:\Users\<사용자이름>\.cursor\mcp.json` (또는 `~/.cursor/mcp.json`)
+
+[`mcp_config.example.json`](mcp_config.example.json)과 동일한 JSON 형식입니다:
+```json
+{
+  "mcpServers": {
+    "bass-sound-to-musescore": {
+      "command": "C:\\dev\\bass-sound-to-muse-score\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "bass_mcp"],
+      "env": {
+        "BASS_MCP_OUTPUT_DIR": "C:\\dev\\bass-sound-to-muse-score\\output"
+      }
+    }
+  }
+}
+```
+
+*(macOS/Linux에서는 `"command"` 경로를 `/path/to/bass-sound-to-muse-score/.venv/bin/python`으로 바꾸세요. 선택 보안 옵션으로 `BASS_MCP_ALLOWED_DIRS` 환경변수에 `;`로 구분된 허용 폴더를 지정하면 그 외 로컬 음원 접근을 차단합니다.)*
+
+---
+
+## 처음 사용하는 분을 위한 대화 예시 (Quick Start)
+
+1. **연결 확인:** AI 채팅창에 아래와 같이 입력해 `demucs`, `librosa`, `ffmpeg`, `MuseScore4` 인식을 확인합니다.
+   > `베이스 MCP 환경 상태 확인해줘`
+2. **유튜브 또는 음원 파일로 타브 악보 요청:**
+   > `https://www.youtube.com/watch?v=Pxn4J9DyQZA 이 곡 베이스 타브 악보 뽑아줘`
+3. **곡명·원본 BPM 확인 응답:**
+   AI가 웹에서 조회한 곡명과 원본 BPM(예: `SPYAIR - Some Like It Hot, 113 BPM`)을 먼저 확인해 주면 그대로 진행하거나 수정 BPM을 알려줍니다.
+   > `응 113 BPM 맞아, 그대로 변환해줘` *(틀릴 경우 예: `원곡 118 BPM이야, 이걸로 뽑아줘`)*
+4. **결과물 확인:** `output/job_.../` 폴더에 생성된 `bass_score.mscz` (또는 `bass_score.musicxml`, `bass_line.mid`)를 **MuseScore 4**로 열면 전주/간주 쉼표가 유지된 오선보 + 4현/5현 TAB + 코드 기호를 바로 확인할 수 있습니다.
 
 ---
 
@@ -85,12 +161,17 @@ Claude Desktop, Cursor, Claude Code, Gemini CLI 등의 MCP 설정 파일에 아�
 
 ---
 
-## 오픈소스 라이선스 및 출처 표기 (Attributions)
+## Public 공개 가능 여부 및 오픈소스 라이선스 안내
 
-자세한 전문과 고지사항은 [LICENSE](LICENSE), [NOTICE](NOTICE), [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)를 참고하세요.
+- **GitHub Public 저장소 공개 가능 여부:** **공개 가능(안전)**. 본 프로젝트 코드는 **MIT License**이며, 핵심 Python 의존성도 모두 MIT/BSD/ISC/Apache-2.0/Unlicense 등 퍼미시브 라이선스입니다. GPL-3.0인 **MuseScore 4**와 **FFmpeg**는 코드를 링크하거나 동봉하지 않고 사용자 PC에 설치된 별도 실행 파일을 외부 CLI 서브프로세스로만 호출하므로(FSF GPLv3 FAQ의 별개 프로그램 기준), 본 저장소 코드에 GPL이 전파되지 않습니다.
+- **공개 시 주의사항:**
+  - `.gitignore`에 이미 포함된 `output/`, `*.wav`, `*.mp3`, `*.mid`, `*.musicxml`, `*.mscz` 등 **유튜브 다운로드 음원 및 생성 악보 파일(원곡 저작물 파생물)과 Demucs 사전학습 모델 가중치는 저장소에 커밋하지 마세요.**
+  - 자세한 전문과 출처 고지는 [LICENSE](LICENSE), [NOTICE](NOTICE), [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)를 참고하세요.
 
 - **Spotify Basic Pitch** (`spotify/basic-pitch`) — Apache License 2.0
 - **Meta / Facebook Research Demucs** (`facebookresearch/demucs`) — MIT License (사전학습 모델 가중치는 별도 데이터셋 약관 확인 필요)
+- **librosa** (`librosa/librosa`) — ISC License
+- **NumPy / SciPy / websockets** — BSD 3-Clause License
 - **ghchen99/mcp-musescore** (`ghchen99/mcp-musescore`) — MIT License
 - **sandraschi/stems-mcp** (`sandraschi/stems-mcp`) — MIT License
 - **pretty_midi** (`craffel/pretty-midi`) — MIT License
