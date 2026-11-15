@@ -193,3 +193,18 @@ def test_repeated_same_pitch_notes_split_cleanly(tmp_path: Path) -> None:
     res = transcribe_bass_notes(wav_path, min_midi=28)
     assert res["engine"] == "librosa:pyin"
     assert len(res["notes"]) >= 5
+
+
+def test_two_tap_16th_double_hits_preserved() -> None:
+    from bass_mcp.transcriber import BassNote, _clean_transcribed_notes
+
+    # Two 16th-note double taps (~133ms IOI at 113 BPM) must NOT merge, while 55ms jitter merges.
+    notes = [
+        BassNote(32, "G#1", 1.000, 0.130, 86),
+        BassNote(32, "G#1", 1.132, 0.140, 84),
+        BassNote(31, "G1", 2.000, 0.055, 76),
+        BassNote(31, "G1", 2.055, 0.150, 88),
+    ]
+    cleaned = _clean_transcribed_notes(notes, min_velocity=62)
+    assert len(cleaned) == 3
+    assert [round(n.onset_sec, 3) for n in cleaned] == [1.0, 1.132, 2.0]

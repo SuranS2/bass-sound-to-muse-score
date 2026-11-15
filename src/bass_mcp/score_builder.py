@@ -31,7 +31,7 @@ STRINGS_5: tuple[tuple[int, int, str, int], ...] = (
 )
 MAX_FRET = 24
 
-_STEP_ALTER = (
+_STEP_ALTER_SHARP = (
     ("C", 0),
     ("C", 1),
     ("D", 0),
@@ -45,7 +45,37 @@ _STEP_ALTER = (
     ("A", 1),
     ("B", 0),
 )
-_PC_LABELS = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
+_STEP_ALTER_FLAT = (
+    ("C", 0),
+    ("D", -1),
+    ("D", 0),
+    ("E", -1),
+    ("E", 0),
+    ("F", 0),
+    ("G", -1),
+    ("G", 0),
+    ("A", -1),
+    ("A", 0),
+    ("B", -1),
+    ("B", 0),
+)
+_PC_LABELS_SHARP = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
+_PC_LABELS_FLAT = ("C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B")
+_MAJOR_SCALE_INTERVALS = (0, 2, 4, 5, 7, 9, 11)
+# Circle-of-fifths major pitch classes keyed by fifths (-5..5)
+_FIFTHS_TO_MAJOR_PC: tuple[tuple[int, int], ...] = (
+    (0, 0),
+    (1, 7),
+    (-1, 5),
+    (2, 2),
+    (-2, 10),
+    (3, 9),
+    (-3, 3),
+    (4, 4),
+    (-4, 8),
+    (5, 11),
+    (-5, 1),
+)
 
 _DURATION_TOKENS: tuple[tuple[int, str, bool], ...] = (
     (16, "whole", False),
@@ -75,7 +105,7 @@ class TabbedBassNote:
 
 @dataclass(frozen=True)
 class MeasureChord:
-    """Inferred chord symbol for a single measure."""
+    """Inferred chord symbol for a measure (or half-measure)."""
 
     measure_num: int
     root_step: str
@@ -83,6 +113,7 @@ class MeasureChord:
     quality_suffix: str
     musicxml_kind: str
     symbol: str
+    beat_offset: int = 0
 
 
 def _strings_for_count(string_count: int) -> tuple[tuple[int, int, str, int], ...]:
@@ -102,19 +133,42 @@ def _fit_pitch_to_bass_range(pitch_midi: int, min_midi: int, max_midi: int) -> i
     return max(min_midi, min(max_midi, p))
 
 
-def normalize_note_onsets(notes: list[BassNote], min_trim_sec: float = 0.25) -> list[BassNote]:
-    """Shift leading silence so the first bass entrance aligns near t=0 (Measure 1, Beat 1)."""
+def normalize_note_onsets(
+    notes: list[BassNote],
+    min_trim_sec: float = 0.25,
+    bpm: float | None = None,
+    beats_per_measure: int = 4,
+    preserve_intro_bars: bool = False,
+) -> list[BassNote]:
+    """Shift leading silence while optionally preserving integer intro rest bars for ensemble sync."""
     if not notes:
         return []
     ordered = sorted(notes, key=lambda n: n.onset_sec)
     t0 = ordered[0].onset_sec
-    if t0 <= min_trim_sec:
+    if preserve_intro_bars and bpm and bpm > 0:
+        measure_sec = beats_per_measure * (60.0 / max(bpm, 20.0))
+        if t0 < 0.75 * measure_sec:
+            shift = t0 if t0 > min_trim_sec else 0.0
+        else:
+            bars_raw = t0 / measure_sec
+            frac = bars_raw - int(bars_raw)
+            if frac <= 0.40 or frac >= 0.85:
+                intro_bars = max(0, int(round(bars_raw)))
+                shift = t0 - intro_bars * measure_sec
+            else:
+                shift = 0.0
+    else:
+        if t0 <= min_trim_sec:
+            return ordered
+        shift = t0
+
+    if abs(shift) < 1e-4:
         return ordered
     return [
         BassNote(
             pitch_midi=n.pitch_midi,
             note_name=n.note_name,
-            onset_sec=round(max(0.0, n.onset_sec - t0), 4),
+            onset_sec=round(max(0.0, n.onset_sec - shift), 4),
             duration_sec=n.duration_sec,
             velocity=n.velocity,
             pitch_bend=n.pitch_bend,
@@ -272,17 +326,87 @@ def assign_bass_tab_positions(
     return tabbed
 
 
+def infer_key_fifths(notes: list[TabbedBassNote] | list[BassNote]) -> int:
+    """Infer MusicXML circle-of-fifths key signature (-5..5) from weighted pitch classes."""
+    if not notes:
+        return 0
+    pc_weights = [0.0] * 12
+    for n in notes:
+        pc_weights[n.pitch_midi % 12] += max(0.08, n.duration_sec) * (0.5 + n.velocity / 127.0)
+    total = sum(pc_weights)
+    if total <= 0:
+        return 0
+
+    best_fifths = 0
+    best_score = -1.0
+    for fifths, major_pc in _FIFTHS_TO_MAJOR_PC:
+        scale_pcs = {(major_pc + interval) % 12 for interval in _MAJOR_SCALE_INTERVALS}
+        score = sum(pc_weights[pc] for pc in scale_pcs) - 0.002 * abs(fifths) * total
+        if score > best_score:
+            best_score = score
+            best_fifths = fifths
+    return best_fifths
+
+
+def _diatonic_pcs_for_fifths(key_fifths: int) -> set[int]:
+    for fifths, major_pc in _FIFTHS_TO_MAJOR_PC:
+        if fifths == key_fifths:
+            return {(major_pc + interval) % 12 for interval in _MAJOR_SCALE_INTERVALS}
+    return set(_MAJOR_SCALE_INTERVALS)
+
+
+def _build_chord_for_slice(
+    m_idx: int,
+    m_notes: list[TabbedBassNote],
+    measure_start_sec: float,
+    sec_per_beat: float,
+    beat_offset: int,
+    use_flats: bool,
+    diatonic_pcs: set[int] | None = None,
+) -> MeasureChord:
+    pc_weights: dict[int, float] = {}
+    for n in m_notes:
+        beat_rel = (n.onset_sec - measure_start_sec) / sec_per_beat - beat_offset
+        strong_bonus = 3.5 if beat_rel < 0.5 else (1.3 if abs(beat_rel - 2.0) < 0.5 else 1.0)
+        pc = n.pitch_midi % 12
+        pc_weights[pc] = pc_weights.get(pc, 0.0) + max(0.1, n.duration_sec) * strong_bonus
+
+    root_pc = max(pc_weights, key=lambda k: pc_weights[k])
+    intervals = {(n.pitch_midi % 12 - root_pc) % 12 for n in m_notes}
+    if 3 in intervals and 4 not in intervals:
+        suffix, kind = ("m7", "minor-seventh") if 10 in intervals else ("m", "minor")
+    elif 4 in intervals:
+        suffix, kind = ("7", "dominant") if 10 in intervals else (("maj7", "major-seventh") if 11 in intervals else ("", "major"))
+    elif 10 in intervals:
+        suffix, kind = "7", "dominant"
+    elif 11 in intervals:
+        suffix, kind = "maj7", "major-seventh"
+    elif diatonic_pcs and ((root_pc + 3) % 12 in diatonic_pcs) and ((root_pc + 4) % 12 not in diatonic_pcs):
+        suffix, kind = "m", "minor"
+    else:
+        suffix, kind = "", "major"
+
+    step, alter = (_STEP_ALTER_FLAT if use_flats else _STEP_ALTER_SHARP)[root_pc]
+    label = (_PC_LABELS_FLAT if use_flats else _PC_LABELS_SHARP)[root_pc]
+    return MeasureChord(m_idx, step, alter, suffix, kind, f"{label}{suffix}", beat_offset=beat_offset)
+
+
 def infer_measure_chords(
     notes: list[TabbedBassNote],
     bpm: float = 120.0,
     beats_per_measure: int = 4,
+    key_fifths: int | None = None,
 ) -> list[MeasureChord]:
-    """Infer a root-and-quality chord symbol per measure from bass notes."""
+    """Infer root-and-quality chord symbols per measure (splitting half-bars when root changes)."""
     if not notes:
         return [MeasureChord(1, "E", 0, "", "major", "E")]
 
+    inferred_fifths = infer_key_fifths(notes) if key_fifths is None else key_fifths
+    use_flats = inferred_fifths < 0
+    diatonic_pcs = _diatonic_pcs_for_fifths(inferred_fifths)
     sec_per_beat = 60.0 / max(bpm, 20.0)
     measure_sec = beats_per_measure * sec_per_beat
+    half_beats = beats_per_measure // 2
     max_end = max(n.onset_sec + n.duration_sec for n in notes)
     total_measures = max(1, int((max_end - 1e-6) // measure_sec) + 1)
 
@@ -292,53 +416,49 @@ def infer_measure_chords(
         buckets[m_idx].append(n)
 
     chords: list[MeasureChord] = []
-    last_chord = MeasureChord(1, "E", 0, "", "major", "E")
+    last_chord: MeasureChord | None = None
 
     for m_idx in range(1, total_measures + 1):
         m_notes = buckets[m_idx]
         if not m_notes:
-            chords.append(
-                MeasureChord(
-                    m_idx,
-                    last_chord.root_step,
-                    last_chord.root_alter,
-                    last_chord.quality_suffix,
-                    last_chord.musicxml_kind,
-                    last_chord.symbol,
+            if last_chord is not None:
+                chords.append(
+                    MeasureChord(
+                        m_idx,
+                        last_chord.root_step,
+                        last_chord.root_alter,
+                        last_chord.quality_suffix,
+                        last_chord.musicxml_kind,
+                        last_chord.symbol,
+                    )
                 )
-            )
             continue
 
-        # Weight notes near beat 1 & beat 3 most heavily for root selection.
-        pc_weights: dict[int, float] = {}
-        for n in m_notes:
-            beat_in_bar = (n.onset_sec - (m_idx - 1) * measure_sec) / sec_per_beat
-            strong_bonus = 3.5 if beat_in_bar < 0.5 else (1.3 if abs(beat_in_bar - 2.0) < 0.5 else 1.0)
-            pc = n.pitch_midi % 12
-            pc_weights[pc] = pc_weights.get(pc, 0.0) + max(0.1, n.duration_sec) * strong_bonus
+        m_start = (m_idx - 1) * measure_sec
+        if beats_per_measure >= 4:
+            split_sec = m_start + max(0.5, half_beats - 0.55) * sec_per_beat
+            first_half = [n for n in m_notes if n.onset_sec < split_sec]
+            second_half = [n for n in m_notes if n.onset_sec >= split_sec]
+            if first_half and second_half:
+                c1 = _build_chord_for_slice(m_idx, first_half, m_start, sec_per_beat, 0, use_flats, diatonic_pcs)
+                c2 = _build_chord_for_slice(m_idx, second_half, m_start, sec_per_beat, half_beats, use_flats, diatonic_pcs)
+                first_pcs = {n.pitch_midi % 12 for n in first_half}
+                second_pcs = {n.pitch_midi % 12 for n in second_half}
+                w1 = sum(max(0.1, n.duration_sec) for n in first_half)
+                w2 = sum(max(0.1, n.duration_sec) for n in second_half)
+                r1 = max({n.pitch_midi % 12 for n in first_half}, key=lambda pc: sum(max(0.1, n.duration_sec) for n in first_half if n.pitch_midi % 12 == pc))
+                r2 = max({n.pitch_midi % 12 for n in second_half}, key=lambda pc: sum(max(0.1, n.duration_sec) for n in second_half if n.pitch_midi % 12 == pc))
+                is_arpeggio_fifth = len(first_pcs) >= 2 and len(second_pcs) == 1 and ((r2 - r1) % 12 in (0, 3, 4, 7))
+                if r1 != r2 and not is_arpeggio_fifth and w2 >= 0.35 * (w1 + w2):
+                    chords.extend((c1, c2))
+                    last_chord = c2
+                    continue
 
-        root_pc = max(pc_weights, key=lambda k: pc_weights[k])
-        intervals = {(n.pitch_midi % 12 - root_pc) % 12 for n in m_notes}
-
-        if 3 in intervals and 4 not in intervals:
-            if 10 in intervals:
-                suffix, kind = "m7", "minor-seventh"
-            else:
-                suffix, kind = "m", "minor"
-        elif 10 in intervals:
-            suffix, kind = "7", "dominant"
-        elif 11 in intervals:
-            suffix, kind = "maj7", "major-seventh"
-        else:
-            suffix, kind = "", "major"
-
-        step, alter = _STEP_ALTER[root_pc]
-        symbol = f"{_PC_LABELS[root_pc]}{suffix}"
-        chord = MeasureChord(m_idx, step, alter, suffix, kind, symbol)
+        chord = _build_chord_for_slice(m_idx, m_notes, m_start, sec_per_beat, 0, use_flats, diatonic_pcs)
         chords.append(chord)
         last_chord = chord
 
-    return chords
+    return chords or [MeasureChord(1, "E", 0, "", "major", "E")]
 
 
 def _encode_vlq(value: int) -> bytes:
@@ -491,9 +611,10 @@ def _append_pitched_note(
     include_tab: bool,
     tie_start: bool = False,
     tie_stop: bool = False,
+    use_flats: bool = False,
 ) -> None:
     parts = _decompose_divisions(dur_div)
-    step, alter = _STEP_ALTER[note.pitch_midi % 12]
+    step, alter = (_STEP_ALTER_FLAT if use_flats else _STEP_ALTER_SHARP)[note.pitch_midi % 12]
     octave = (note.pitch_midi // 12) - 1
 
     for idx, (part_div, note_type, dotted) in enumerate(parts):
@@ -546,7 +667,9 @@ def write_musicxml_score(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     measure_div = beats_per_measure * DIVISIONS_PER_QUARTER
     total_measures, grid_items = _quantize_notes_to_grid(notes, bpm, beats_per_measure)
-    total_measures = max(total_measures, len(chords))
+    total_measures = max(total_measures, max((c.measure_num for c in chords), default=0))
+    key_fifths = infer_key_fifths(notes)
+    use_flats = key_fifths < 0
 
     # Split notes cleanly across bar boundaries.
     per_measure: dict[int, list[tuple[int, int, TabbedBassNote, bool, bool]]] = {
@@ -588,7 +711,9 @@ def write_musicxml_score(
     ET.SubElement(midi_inst, "midi-program").text = "34"
 
     part = ET.SubElement(root, "part", {"id": "P1"})
-    chord_by_measure = {c.measure_num: c for c in chords}
+    chords_by_measure: dict[int, list[MeasureChord]] = {}
+    for c in chords:
+        chords_by_measure.setdefault(c.measure_num, []).append(c)
 
     for m_idx in range(1, total_measures + 1):
         measure_el = ET.SubElement(part, "measure", {"number": str(m_idx)})
@@ -596,7 +721,7 @@ def write_musicxml_score(
             attrs = ET.SubElement(measure_el, "attributes")
             ET.SubElement(attrs, "divisions").text = str(DIVISIONS_PER_QUARTER)
             key = ET.SubElement(attrs, "key")
-            ET.SubElement(key, "fifths").text = "0"
+            ET.SubElement(key, "fifths").text = str(key_fifths)
             time_el = ET.SubElement(attrs, "time")
             ET.SubElement(time_el, "beats").text = str(beats_per_measure)
             ET.SubElement(time_el, "beat-type").text = "4"
@@ -625,14 +750,15 @@ def write_musicxml_score(
             ET.SubElement(metronome, "per-minute").text = str(int(round(bpm)))
             ET.SubElement(direction, "sound", {"tempo": str(round(bpm, 1))})
 
-        chord = chord_by_measure.get(m_idx)
-        if chord is not None:
+        for chord in chords_by_measure.get(m_idx, ()):
             harmony = ET.SubElement(measure_el, "harmony", {"placement": "above"})
             root_el = ET.SubElement(harmony, "root")
             ET.SubElement(root_el, "root-step").text = chord.root_step
             if chord.root_alter != 0:
                 ET.SubElement(root_el, "root-alter").text = str(chord.root_alter)
             ET.SubElement(harmony, "kind").text = chord.musicxml_kind
+            if chord.beat_offset > 0:
+                ET.SubElement(harmony, "offset").text = str(chord.beat_offset * DIVISIONS_PER_QUARTER)
 
         events = sorted(per_measure[m_idx], key=lambda x: x[0])
 
@@ -652,6 +778,7 @@ def write_musicxml_score(
                     include_tab=include_tab,
                     tie_start=tie_start,
                     tie_stop=tie_stop,
+                    use_flats=use_flats,
                 )
                 cursor = start_off + dur_div
             if cursor < measure_div:
@@ -675,8 +802,14 @@ def render_ascii_bass_tab(
     strings = _strings_for_count(string_count)
     measure_div = beats_per_measure * DIVISIONS_PER_QUARTER
     total_measures, grid_items = _quantize_notes_to_grid(notes, bpm, beats_per_measure)
-    total_measures = max(total_measures, len(chords))
-    chord_by_measure = {c.measure_num: c.symbol for c in chords}
+    total_measures = max(total_measures, max((c.measure_num for c in chords), default=0))
+    chord_by_measure: dict[int, str] = {}
+    for c in chords:
+        chord_by_measure[c.measure_num] = (
+            f"{chord_by_measure[c.measure_num]}/{c.symbol}"
+            if c.measure_num in chord_by_measure
+            else c.symbol
+        )
 
     # Build per-measure string grids (16 columns per 4/4 measure, 2 chars per step).
     cell_width = 2
