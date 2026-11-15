@@ -24,6 +24,7 @@ from bass_mcp.score_builder import (
     convert_with_musescore_cli,
     find_musescore_binary,
     infer_measure_chords,
+    normalize_note_onsets,
     render_ascii_bass_tab,
     write_midi_file,
     write_musicxml_score,
@@ -85,7 +86,8 @@ def _build_score_artifacts(
     bpm: float,
     string_count: int,
 ) -> dict[str, Any]:
-    tabbed = assign_bass_tab_positions(notes, string_count=string_count)
+    aligned_notes = normalize_note_onsets(notes)
+    tabbed = assign_bass_tab_positions(aligned_notes, string_count=string_count)
     chords = infer_measure_chords(tabbed, bpm=bpm)
 
     midi_path = write_midi_file(tabbed, job_dir / "bass_line.mid", bpm=bpm)

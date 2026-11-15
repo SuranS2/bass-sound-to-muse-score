@@ -112,6 +112,14 @@ def _yin_pitch_frame(frame: np.ndarray, sr: int, tau_min: int, tau_max: int, thr
             return None
         tau = best_tau
 
+    # Guard against 2nd-harmonic octave lock on higher candidates (f > 165 Hz).
+    if tau > 0 and (float(sr) / float(tau)) > 165.0 and (2 * tau) < (tau_max - 1):
+        sub_start = max(tau_min, 2 * tau - 3)
+        sub_end = min(tau_max, 2 * tau + 4)
+        sub_window = cmndf[sub_start:sub_end]
+        if len(sub_window) > 0 and float(np.min(sub_window)) < 0.30:
+            tau = sub_start + int(np.argmin(sub_window))
+
     # Parabolic interpolation around tau for sub-sample frequency precision.
     if 1 <= tau < tau_max - 1:
         s0, s1, s2 = cmndf[tau - 1], cmndf[tau], cmndf[tau + 1]
@@ -231,7 +239,17 @@ def _transcribe_builtin_yin(
     peak_rms = float(np.max(rms_frames)) if len(rms_frames) else 0.0
     if peak_rms < 1e-5:
         return []
-    rms_gate = peak_rms * 0.04
+
+    active_rms = rms_frames[rms_frames > peak_rms * 0.04]
+    if len(active_rms) > 0:
+        p25 = float(np.percentile(active_rms, 25))
+        p85 = float(np.percentile(active_rms, 85))
+        if p85 > 2.2 * max(p25, 1e-8):
+            rms_gate = max(peak_rms * 0.17, p25 * 1.25)
+        else:
+            rms_gate = peak_rms * 0.05
+    else:
+        rms_gate = peak_rms * 0.05
 
     midi_frames = np.full(n_frames, -1, dtype=np.int32)
     for i in range(n_frames):
@@ -242,7 +260,7 @@ def _transcribe_builtin_yin(
         if hz is not None and f_min <= hz <= f_max:
             midi_frames[i] = int(round(hz_to_midi(hz)))
 
-    return _segments_from_frame_pitches(
+    notes = _segments_from_frame_pitches(
         midi_frames=midi_frames,
         rms_frames=rms_frames,
         hop_sec=hop / float(sr),
@@ -250,6 +268,7 @@ def _transcribe_builtin_yin(
         max_midi=max_midi,
         min_note_len_sec=min_note_len_sec,
     )
+    return _clean_transcribed_notes(notes)
 
 
 def _transcribe_basic_pitch(
@@ -283,7 +302,7 @@ def _transcribe_basic_pitch(
                 pitch_bend=bend,
             )
         )
-    return _enforce_monophonic_bass(notes)
+    return _clean_transcribed_notes(_enforce_monophonic_bass(notes))
 
 
 def _transcribe_librosa_pyin(
@@ -310,7 +329,7 @@ def _transcribe_librosa_pyin(
         if voiced_flag[i] and np.isfinite(f0[i]):
             midi_frames[i] = int(round(hz_to_midi(float(f0[i]))))
 
-    return _segments_from_frame_pitches(
+    notes = _segments_from_frame_pitches(
         midi_frames=midi_frames,
         rms_frames=rms[:n],
         hop_sec=hop / float(sr),
@@ -318,6 +337,45 @@ def _transcribe_librosa_pyin(
         max_midi=max_midi,
         min_note_len_sec=min_note_len_sec,
     )
+    return _clean_transcribed_notes(notes)
+
+
+def _clean_transcribed_notes(notes: list[BassNote]) -> list[BassNote]:
+    """Filter low-energy bleed/harmonic ghosts and merge micro-split same-pitch plucks."""
+    if not notes:
+        return []
+
+    max_vel = max(n.velocity for n in notes)
+    filtered: list[BassNote] = []
+    for n in notes:
+        if max_vel >= 75 and n.velocity < 66:
+            continue
+        if n.pitch_midi >= 50 and (n.velocity < 78 or n.duration_sec < 0.11):
+            continue
+        filtered.append(n)
+
+    merged: list[BassNote] = []
+    for cur in sorted(filtered, key=lambda item: item.onset_sec):
+        if merged:
+            prev = merged[-1]
+            gap = cur.onset_sec - (prev.onset_sec + prev.duration_sec)
+            if (
+                cur.pitch_midi == prev.pitch_midi
+                and gap <= 0.045
+                and (cur.onset_sec - prev.onset_sec) < 0.14
+            ):
+                new_end = max(prev.onset_sec + prev.duration_sec, cur.onset_sec + cur.duration_sec)
+                merged[-1] = BassNote(
+                    pitch_midi=prev.pitch_midi,
+                    note_name=prev.note_name,
+                    onset_sec=prev.onset_sec,
+                    duration_sec=round(max(0.03, new_end - prev.onset_sec), 4),
+                    velocity=max(prev.velocity, cur.velocity),
+                    pitch_bend=prev.pitch_bend,
+                )
+                continue
+        merged.append(cur)
+    return merged
 
 
 def _enforce_monophonic_bass(notes: list[BassNote]) -> list[BassNote]:
@@ -350,7 +408,7 @@ def _enforce_monophonic_bass(notes: list[BassNote]) -> list[BassNote]:
 
 
 def estimate_bpm(notes: list[BassNote], fallback_bpm: float = 120.0) -> float:
-    """Estimate a practical tempo in [60, 180] BPM from inter-onset intervals."""
+    """Estimate a practical tempo in [60, 180] BPM via IOI clustering and 8th-grid phase locking."""
     if len(notes) < 3:
         return float(fallback_bpm)
     onsets = np.array([n.onset_sec for n in notes], dtype=np.float64)
@@ -360,12 +418,34 @@ def estimate_bpm(notes: list[BassNote], fallback_bpm: float = 120.0) -> float:
         return float(fallback_bpm)
 
     median_ioi = float(np.median(iois))
-    bpm = 60.0 / max(median_ioi, 1e-3)
-    while bpm < 70.0:
-        bpm *= 2.0
-    while bpm > 175.0:
-        bpm *= 0.5
-    return round(bpm, 1)
+    cluster = iois[np.abs(iois - median_ioi) <= 0.18 * median_ioi]
+    cluster_ioi = float(np.median(cluster)) if len(cluster) > 0 else median_ioi
+
+    base_bpm = 60.0 / max(cluster_ioi, 1e-3)
+    while base_bpm < 70.0:
+        base_bpm *= 2.0
+    while base_bpm > 175.0:
+        base_bpm *= 0.5
+
+    sample_notes = notes[:200]
+    t0 = sample_notes[0].onset_sec
+    rel_onsets = np.array([n.onset_sec - t0 for n in sample_notes], dtype=np.float64)
+    vels = np.array([float(n.velocity) for n in sample_notes], dtype=np.float64)
+    sum_vel = max(float(np.sum(vels)), 1.0)
+
+    best_bpm = base_bpm
+    best_score = -float("inf")
+    low_cand = max(60.0, base_bpm - 2.0)
+    high_cand = min(180.0, base_bpm + 2.0)
+    for cand_bpm in np.linspace(low_cand, high_cand, 81):
+        step_sec = 30.0 / max(float(cand_bpm), 20.0)
+        phase = 2.0 * np.pi * rel_onsets / step_sec
+        score = float(np.sum(vels * np.cos(phase))) - 0.15 * abs(float(cand_bpm) - base_bpm) * sum_vel
+        if score > best_score:
+            best_score = score
+            best_bpm = float(cand_bpm)
+
+    return round(best_bpm, 1)
 
 
 def transcribe_bass_notes(
