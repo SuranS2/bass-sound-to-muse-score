@@ -1,0 +1,37 @@
+bass-sound-to-muse-score (bass-mcp)
+Copyright (c) 2026 SuranS2
+
+This project integrates and interoperates with the following open-source projects.
+See THIRD_PARTY_NOTICES.md for complete license texts and attributions.
+
+1. Spotify Basic Pitch (https://github.com/spotify/basic-pitch)
+   Copyright (c) 2022 Spotify AB
+   Licensed under the Apache License, Version 2.0.
+
+2. Meta / Facebook Research Demucs (https://github.com/facebookresearch/demucs)
+   Copyright (c) Meta Platforms, Inc. and affiliates.
+   Source code licensed under the MIT License.
+   Note: Pre-trained Demucs model weights (e.g., htdemucs) may carry upstream
+   training dataset (MUSDB18-HQ) research/non-commercial terms.
+
+3. ghchen99/mcp-musescore (https://github.com/ghchen99/mcp-musescore)
+   Copyright (c) 2025 ghchen99
+   Licensed under the MIT License.
+   The MuseScore 4 QML WebSocket plugin and bridge protocol in this repository
+   are adapted from ghchen99/mcp-musescore with loopback-only hardening.
+
+4. sandraschi/stems-mcp (https://github.com/sandraschi/stems-mcp)
+   Copyright (c) sandraschi
+   Licensed under the MIT License.
+   Architectural reference for local stem separation in MCP workflows.
+
+5. Model Context Protocol Python SDK / FastMCP (https://github.com/modelcontextprotocol/python-sdk)
+   Copyright (c) Anthropic, PBC
+   Licensed under the MIT License.
+
+6. pretty_midi (https://github.com/craffel/pretty-midi)
+   Copyright (c) 2014 Colin Raffel
+   Licensed under the MIT License.
+
+7. yt-dlp (https://github.com/yt-dlp/yt-dlp)
+   Released into the public domain under The Unlicense.
