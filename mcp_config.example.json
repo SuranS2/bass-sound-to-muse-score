@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "bass-sound-to-musescore": {
+      "command": "C:\\dev\\bass-sound-to-muse-score\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "bass_mcp"],
+      "env": {
+        "BASS_MCP_OUTPUT_DIR": "C:\\dev\\bass-sound-to-muse-score\\output"
+      }
+    }
+  }
+}
