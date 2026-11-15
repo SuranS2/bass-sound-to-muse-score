@@ -5,15 +5,19 @@ from __future__ import annotations
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+import pytest
+
 from bass_mcp.score_builder import (
     _quantize_notes_to_grid,
     assign_bass_tab_positions,
     infer_measure_chords,
+    infer_time_signature,
     normalize_note_onsets,
     render_ascii_bass_tab,
     write_midi_file,
     write_musicxml_score,
 )
+from bass_mcp.security import SecurityValidationError
 from bass_mcp.transcriber import BassNote
 
 
@@ -228,3 +232,88 @@ def test_write_musicxml_embeds_escaped_synced_lyrics(tmp_path: Path) -> None:
     lyric_texts = [el.text for el in root.findall(".//lyric/text")]
     assert any("I am <standing>" in (t or "") for t in lyric_texts)
     assert any("in the line" in (t or "") for t in lyric_texts)
+
+
+def test_pickup_measure_alignment_places_anacrusis_before_downbeat(tmp_path: Path) -> None:
+    bpm = 104.0
+    beat = 60.0 / bpm
+    measure_sec = 4.0 * beat
+
+    # Case 1: 4-bar intro where Bar 4 Beat 4 has a 2-note slide pickup (C#3 -> G#3) before M5 Beat 1 A1 riff.
+    raw_with_intro = [
+        BassNote(49, "C#3", 9.195, 0.11, 86),
+        BassNote(56, "G#3", 9.334, 0.25, 88),
+        *[BassNote(33, "A1", 9.927 + i * (0.5 * beat), 0.25, 86) for i in range(8)],
+    ]
+    aligned_intro = normalize_note_onsets(raw_with_intro, bpm=bpm, preserve_intro_bars=True)
+    assert abs(aligned_intro[2].onset_sec - 4.0 * measure_sec) < 0.01
+    assert aligned_intro[0].onset_sec < 4.0 * measure_sec
+
+    tab_intro = assign_bass_tab_positions(aligned_intro, string_count=4)
+    chords_intro = infer_measure_chords(tab_intro, bpm=bpm)
+    _, grid_intro = _quantize_notes_to_grid(tab_intro, bpm=bpm, beats_per_measure=4)
+    assert grid_intro[0]["start_div"] < 64
+    assert grid_intro[2]["start_div"] == 64  # Measure 5 Beat 1
+    assert chords_intro[-1].measure_num >= 5
+
+    # Case 2: Recording starts directly on Beat 4 pickup -> Measure 1 uses implicit="yes" without leading rest.
+    raw_direct_pickup = [
+        BassNote(49, "C#3", 0.02, 0.11, 86),
+        BassNote(56, "G#3", 0.02 + 0.25 * beat, 0.22, 88),
+        *[BassNote(33, "A1", 0.02 + 1.0 * beat + i * (0.5 * beat), 0.25, 86) for i in range(8)],
+    ]
+    aligned_direct = normalize_note_onsets(raw_direct_pickup, bpm=bpm, preserve_intro_bars=True)
+    tab_direct = assign_bass_tab_positions(aligned_direct, string_count=4)
+    chords_direct = infer_measure_chords(tab_direct, bpm=bpm)
+    xml_path = tmp_path / "pickup_m1.musicxml"
+    write_musicxml_score(tab_direct, chords_direct, xml_path, bpm=bpm)
+    root = ET.parse(xml_path).getroot()
+    m1 = root.find(".//measure[@number='1']")
+    assert m1 is not None and m1.attrib.get("implicit") == "yes"
+    m1_staff1 = [n for n in m1.findall("note") if n.findtext("staff") == "1"]
+    assert m1_staff1 and m1_staff1[0].find("rest") is None
+    m2_staff1 = [n for n in root.findall(".//measure[@number='2']/note") if n.findtext("staff") == "1"]
+    assert m2_staff1 and m2_staff1[0].find("rest") is None
+    assert m2_staff1[0].findtext("./pitch/step") == "A"
+
+
+def test_time_signature_selection_and_auto_inference(tmp_path: Path) -> None:
+    bpm = 120.0
+    beat = 60.0 / bpm
+
+    # Explicit 3/4 and 6/8 MusicXML rendering & validation guard.
+    notes = assign_bass_tab_positions([BassNote(33, "A1", i * beat, 0.4, 85) for i in range(6)])
+    chords_3_4 = infer_measure_chords(notes, bpm=bpm, beats_per_measure=3, beat_type=4)
+    xml_3_4 = tmp_path / "waltz.musicxml"
+    write_musicxml_score(notes, chords_3_4, xml_3_4, bpm=bpm, time_signature="3/4")
+    r_3_4 = ET.parse(xml_3_4).getroot()
+    assert r_3_4.findtext(".//attributes/time/beats") == "3"
+    assert r_3_4.findtext(".//attributes/time/beat-type") == "4"
+
+    chords_6_8 = infer_measure_chords(notes, bpm=bpm, beats_per_measure=6, beat_type=8)
+    xml_6_8 = tmp_path / "compound.musicxml"
+    write_musicxml_score(notes, chords_6_8, xml_6_8, bpm=bpm, time_signature="6/8")
+    r_6_8 = ET.parse(xml_6_8).getroot()
+    assert r_6_8.findtext(".//attributes/time/beats") == "6"
+    assert r_6_8.findtext(".//attributes/time/beat-type") == "8"
+
+    with pytest.raises(SecurityValidationError):
+        write_musicxml_score(notes, chords_3_4, tmp_path / "bad.musicxml", bpm=bpm, time_signature="99/3")
+
+    # Auto inference: 3-beat harmonic cycle (C -> F -> G -> C every 3 beats) -> (3, 4).
+    waltz_pitches = [36, 41, 43, 36, 41, 43]
+    waltz_notes = [
+        BassNote(p, "N", (bar * 3 + b) * beat, 0.45, 85)
+        for bar, p in enumerate(waltz_pitches)
+        for b in range(3)
+    ]
+    assert infer_time_signature(waltz_notes, bpm=bpm) == (3, 4)
+
+    # Auto inference: 4-beat rock root cycle (every 4 beats) -> (4, 4).
+    rock_pitches = [36, 41, 43, 36, 41, 43]
+    rock_notes = [
+        BassNote(p, "N", (bar * 4 + b) * beat, 0.45, 85)
+        for bar, p in enumerate(rock_pitches)
+        for b in range(4)
+    ]
+    assert infer_time_signature(rock_notes, bpm=bpm) == (4, 4)

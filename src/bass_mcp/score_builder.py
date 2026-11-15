@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import shutil
 import struct
 import xml.etree.ElementTree as ET
@@ -14,6 +15,7 @@ from bass_mcp.security import SecurityValidationError, run_safe_command
 from bass_mcp.transcriber import BassNote
 
 DIVISIONS_PER_QUARTER = 4  # 16th-note grid
+_TIME_SIG_RE = re.compile(r"^\s*(\d{1,2})\s*/\s*(2|4|8|16)\s*$")
 
 # MusicXML string 1 = highest-pitched string (G), string N = lowest-pitched string (E or B)
 STRINGS_4: tuple[tuple[int, int, str, int], ...] = (
@@ -133,27 +135,187 @@ def _fit_pitch_to_bass_range(pitch_midi: int, min_midi: int, max_midi: int) -> i
     return max(min_midi, min(max_midi, p))
 
 
+def _measure_divisions(beats_per_measure: int, beat_type: int = 4) -> int:
+    return max(4, (beats_per_measure * 4 * DIVISIONS_PER_QUARTER) // max(1, beat_type))
+
+
+def _quarter_beats_per_measure(beats_per_measure: int, beat_type: int = 4) -> float:
+    return float(beats_per_measure) * (4.0 / float(max(1, beat_type)))
+
+
+def parse_time_signature(time_signature: str | None) -> tuple[int, int] | None:
+    """Parse '<beats>/<beat_type>' or return None for 'auto'/unset; reject unsafe formats."""
+    if time_signature is None:
+        return None
+    raw = str(time_signature).strip().lower()
+    if raw in {"", "auto"}:
+        return None
+    match = _TIME_SIG_RE.fullmatch(raw)
+    if not match:
+        raise SecurityValidationError(
+            "time_signature must be 'auto' or '<beats>/<beat_type>' (e.g. '4/4', '3/4', '6/8')."
+        )
+    beats = int(match.group(1))
+    beat_type = int(match.group(2))
+    if not (1 <= beats <= 16):
+        raise SecurityValidationError("time_signature beats must be between 1 and 16.")
+    return beats, beat_type
+
+
+def infer_time_signature(notes: list[BassNote], bpm: float = 120.0) -> tuple[int, int]:
+    """Infer 4/4, 3/4, or 6/8 from root-change phrase periodicity (defaulting to 4/4)."""
+    if len(notes) < 6 or bpm <= 0:
+        return (4, 4)
+
+    ordered = sorted(notes, key=lambda n: n.onset_sec)
+    beat_sec = 60.0 / max(bpm, 20.0)
+    transitions = [
+        n
+        for idx, n in enumerate(ordered)
+        if idx == 0
+        or n.pitch_midi != ordered[idx - 1].pitch_midi
+        or (n.onset_sec - ordered[idx - 1].onset_sec) >= 1.6 * beat_sec
+    ]
+    if len(transitions) < 4:
+        return (4, 4)
+
+    dt3_count = 0
+    dt4_count = 0
+    for idx in range(len(transitions) - 1):
+        dt = transitions[idx + 1].onset_sec - transitions[idx].onset_sec
+        if any(abs(dt - mult * beat_sec) <= 0.22 * beat_sec for mult in (3.0, 6.0)):
+            dt3_count += 1
+        if any(abs(dt - mult * beat_sec) <= 0.22 * beat_sec for mult in (2.0, 4.0, 8.0)):
+            dt4_count += 1
+
+    t_anchor = transitions[0].onset_sec
+    p3 = 3.0 * beat_sec
+    p4 = 4.0 * beat_sec
+    hits_3 = sum(
+        1
+        for n in transitions
+        if abs((n.onset_sec - t_anchor) / p3 - round((n.onset_sec - t_anchor) / p3)) * p3 <= 0.25 * beat_sec
+    )
+    hits_4 = sum(
+        1
+        for n in transitions
+        if abs((n.onset_sec - t_anchor) / p4 - round((n.onset_sec - t_anchor) / p4)) * p4 <= 0.25 * beat_sec
+    )
+
+    if dt3_count >= max(3, int(dt4_count * 1.5) + 1) and hits_3 > hits_4 * 1.25:
+        dotted_q = 0
+        quarter = 0
+        for idx in range(len(ordered) - 1):
+            dt = ordered[idx + 1].onset_sec - ordered[idx].onset_sec
+            if abs(dt - 1.5 * beat_sec) <= 0.18 * beat_sec:
+                dotted_q += 1
+            elif abs(dt - 1.0 * beat_sec) <= 0.18 * beat_sec:
+                quarter += 1
+        return (6, 8) if dotted_q > quarter else (3, 4)
+
+    return (4, 4)
+
+
+def resolve_time_signature(
+    notes: list[BassNote],
+    bpm: float = 120.0,
+    time_signature: str | None = None,
+    beats_per_measure: int = 4,
+    beat_type: int = 4,
+) -> tuple[int, int]:
+    """Return user-selected time signature or AI-inferred meter when unset/'auto'."""
+    if time_signature is not None:
+        parsed = parse_time_signature(time_signature)
+        return parsed if parsed is not None else infer_time_signature(notes, bpm=bpm)
+    return beats_per_measure, beat_type
+
+
+def _detect_riff_downbeat_sec(
+    notes: list[BassNote],
+    bpm: float,
+    quarter_beats_per_measure: float = 4.0,
+) -> float:
+    """Identify when initial notes are an anacrusis/pickup before the main riff downbeat."""
+    ordered = sorted(notes, key=lambda n: n.onset_sec)
+    if len(ordered) < 5 or bpm <= 0:
+        return ordered[0].onset_sec
+
+    beat_sec = 60.0 / max(bpm, 20.0)
+    half_beat = 0.5 * beat_sec
+
+    def _metrics(k: int) -> tuple[float, int]:
+        sub = ordered[k : min(len(ordered), k + 10)]
+        t_ref = ordered[k].onset_sec
+        errs = [
+            abs((n.onset_sec - t_ref) / half_beat - round((n.onset_sec - t_ref) / half_beat))
+            for n in sub[1:]
+        ]
+        mean_err = (sum(errs) / len(errs)) if errs else 0.0
+        same_run = sum(
+            1
+            for n in ordered[k + 1 : k + 5]
+            if n.pitch_midi == ordered[k].pitch_midi and (n.onset_sec - t_ref) <= 3.0 * beat_sec
+        )
+        return mean_err, same_run
+
+    err_0, run_0 = _metrics(0)
+    if run_0 >= 2 and err_0 <= 0.20:
+        return ordered[0].onset_sec
+
+    max_pickup_beats = max(1.0, quarter_beats_per_measure - 0.4)
+    for k in range(1, min(5, len(ordered) - 3)):
+        pickup_span = ordered[k].onset_sec - ordered[0].onset_sec
+        if not (0.20 * beat_sec <= pickup_span <= max_pickup_beats * beat_sec):
+            continue
+        pitch_drop = max(n.pitch_midi for n in ordered[:k]) - ordered[k].pitch_midi
+        prev_gap_beats = (ordered[k].onset_sec - ordered[k - 1].onset_sec) / beat_sec
+        err_k, run_k = _metrics(k)
+        distinct_pickup = all(n.pitch_midi != ordered[k].pitch_midi for n in ordered[:k])
+        if err_k <= 0.18 and run_k >= 2 and (
+            (pitch_drop >= 5 and prev_gap_beats >= 0.50)
+            or (err_0 - err_k >= 0.15 and prev_gap_beats >= 0.65)
+            or (run_k >= 3 and distinct_pickup and pickup_span <= 2.25 * beat_sec)
+        ):
+            return ordered[k].onset_sec
+
+    return ordered[0].onset_sec
+
+
 def compute_onset_shift_sec(
     notes: list[BassNote],
     min_trim_sec: float = 0.25,
     bpm: float | None = None,
     beats_per_measure: int = 4,
     preserve_intro_bars: bool = False,
+    beat_type: int = 4,
 ) -> float:
-    """Return leading time shift (seconds) used to align note onsets to bar boundaries."""
+    """Return leading time shift (seconds) aligning downbeats (including pickups) to bar boundaries."""
     if not notes:
         return 0.0
     t0 = min(n.onset_sec for n in notes)
-    if preserve_intro_bars and bpm and bpm > 0:
-        measure_sec = beats_per_measure * (60.0 / max(bpm, 20.0))
-        if t0 < 0.75 * measure_sec:
-            return t0 if t0 > min_trim_sec else 0.0
-        bars_raw = t0 / measure_sec
-        frac = bars_raw - int(bars_raw)
-        if frac <= 0.40 or frac >= 0.85:
-            intro_bars = max(0, int(round(bars_raw)))
-            return t0 - intro_bars * measure_sec
-        return 0.0
+    if bpm and bpm > 0:
+        beat_sec = 60.0 / max(bpm, 20.0)
+        q_beats = _quarter_beats_per_measure(beats_per_measure, beat_type)
+        measure_sec = q_beats * beat_sec
+        t_db = _detect_riff_downbeat_sec(notes, bpm=bpm, quarter_beats_per_measure=q_beats)
+        if (t_db - t0) >= 0.15 * beat_sec and (t_db - t0) < measure_sec:
+            if preserve_intro_bars:
+                target_bars = max(1, int(round(t_db / measure_sec)))
+                if t0 - (t_db - target_bars * measure_sec) < 0.0:
+                    target_bars += 1
+            else:
+                target_bars = 1
+            return t_db - target_bars * measure_sec
+
+        if preserve_intro_bars:
+            if t0 < 0.75 * measure_sec:
+                return t0 if t0 > min_trim_sec else 0.0
+            bars_raw = t0 / measure_sec
+            frac = bars_raw - int(bars_raw)
+            if frac <= 0.40 or frac >= 0.85:
+                intro_bars = max(0, int(round(bars_raw)))
+                return t0 - intro_bars * measure_sec
+            return 0.0
     return t0 if t0 > min_trim_sec else 0.0
 
 
@@ -163,8 +325,9 @@ def normalize_note_onsets(
     bpm: float | None = None,
     beats_per_measure: int = 4,
     preserve_intro_bars: bool = False,
+    beat_type: int = 4,
 ) -> list[BassNote]:
-    """Shift leading silence while optionally preserving integer intro rest bars for ensemble sync."""
+    """Shift leading silence while preserving pickups and integer intro rest bars."""
     if not notes:
         return []
     ordered = sorted(notes, key=lambda n: n.onset_sec)
@@ -174,6 +337,7 @@ def normalize_note_onsets(
         bpm=bpm,
         beats_per_measure=beats_per_measure,
         preserve_intro_bars=preserve_intro_bars,
+        beat_type=beat_type,
     )
     if abs(shift) < 1e-4:
         return ordered
@@ -409,6 +573,7 @@ def infer_measure_chords(
     bpm: float = 120.0,
     beats_per_measure: int = 4,
     key_fifths: int | None = None,
+    beat_type: int = 4,
 ) -> list[MeasureChord]:
     """Infer root-and-quality chord symbols per measure (splitting half-bars when root changes)."""
     if not notes:
@@ -418,8 +583,9 @@ def infer_measure_chords(
     use_flats = inferred_fifths < 0
     diatonic_pcs = _diatonic_pcs_for_fifths(inferred_fifths)
     sec_per_beat = 60.0 / max(bpm, 20.0)
-    measure_sec = beats_per_measure * sec_per_beat
-    half_beats = beats_per_measure // 2
+    q_beats = _quarter_beats_per_measure(beats_per_measure, beat_type)
+    measure_sec = q_beats * sec_per_beat
+    half_beats = int(q_beats // 2)
     max_end = max(n.onset_sec + n.duration_sec for n in notes)
     total_measures = max(1, int((max_end - 1e-6) // measure_sec) + 1)
 
@@ -448,7 +614,7 @@ def infer_measure_chords(
             continue
 
         m_start = (m_idx - 1) * measure_sec
-        if beats_per_measure >= 4:
+        if q_beats >= 4.0:
             split_sec = m_start + max(0.5, half_beats - 0.55) * sec_per_beat
             first_half = [n for n in m_notes if n.onset_sec < split_sec]
             second_half = [n for n in m_notes if n.onset_sec >= split_sec]
@@ -554,9 +720,10 @@ def _quantize_notes_to_grid(
     notes: list[TabbedBassNote],
     bpm: float,
     beats_per_measure: int,
+    beat_type: int = 4,
 ) -> tuple[int, list[dict]]:
     """Snap notes to a non-overlapping 16th-note grid with 8th-note rhythm stabilization."""
-    measure_div = beats_per_measure * DIVISIONS_PER_QUARTER
+    measure_div = _measure_divisions(beats_per_measure, beat_type)
     div_sec = (60.0 / max(bpm, 20.0)) / DIVISIONS_PER_QUARTER
 
     if not notes:
@@ -791,12 +958,21 @@ def write_musicxml_score(
     beats_per_measure: int = 4,
     lyrics: list | None = None,
     lyric_time_shift_sec: float = 0.0,
+    beat_type: int = 4,
+    time_signature: str | None = None,
 ) -> Path:
     """Write a valid 2-staff (Bass Clef + 4/5-string TAB + Chord symbols) MusicXML 4.0 score."""
+    beats_per_measure, beat_type = resolve_time_signature(
+        notes,
+        bpm=bpm,
+        time_signature=time_signature,
+        beats_per_measure=beats_per_measure,
+        beat_type=beat_type,
+    )
     strings = _strings_for_count(string_count)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    measure_div = beats_per_measure * DIVISIONS_PER_QUARTER
-    total_measures, grid_items = _quantize_notes_to_grid(notes, bpm, beats_per_measure)
+    measure_div = _measure_divisions(beats_per_measure, beat_type)
+    total_measures, grid_items = _quantize_notes_to_grid(notes, bpm, beats_per_measure, beat_type=beat_type)
     total_measures = max(total_measures, max((c.measure_num for c in chords), default=0))
     key_fifths = infer_key_fifths(notes)
     use_flats = key_fifths < 0
@@ -861,7 +1037,7 @@ def write_musicxml_score(
             ET.SubElement(key, "fifths").text = str(key_fifths)
             time_el = ET.SubElement(attrs, "time")
             ET.SubElement(time_el, "beats").text = str(beats_per_measure)
-            ET.SubElement(time_el, "beat-type").text = "4"
+            ET.SubElement(time_el, "beat-type").text = str(beat_type)
             ET.SubElement(attrs, "staves").text = "2"
 
             clef1 = ET.SubElement(attrs, "clef", {"number": "1"})
@@ -898,12 +1074,23 @@ def write_musicxml_score(
                 ET.SubElement(harmony, "offset").text = str(chord.beat_offset * DIVISIONS_PER_QUARTER)
 
         events = sorted(per_measure[m_idx], key=lambda x: x[0])
+        is_implicit_pickup = (
+            m_idx == 1
+            and bool(events)
+            and events[0][0] >= (measure_div // 2)
+            and total_measures >= 2
+            and any(e[0] == 0 for e in per_measure.get(2, ()))
+        )
+        if is_implicit_pickup:
+            measure_el.set("implicit", "yes")
+        pickup_start = events[0][0] if is_implicit_pickup else 0
+        backup_div = measure_div - pickup_start
 
         for staff_num, include_tab in ((1, False), (2, True)):
             if staff_num == 2:
                 backup = ET.SubElement(measure_el, "backup")
-                ET.SubElement(backup, "duration").text = str(measure_div)
-            cursor = 0
+                ET.SubElement(backup, "duration").text = str(backup_div)
+            cursor = pickup_start
             for start_off, dur_div, note_obj, tie_start, tie_stop in events:
                 if start_off > cursor:
                     _append_rest(measure_el, start_off - cursor, staff_num)
@@ -941,11 +1128,20 @@ def render_ascii_bass_tab(
     string_count: int = 4,
     beats_per_measure: int = 4,
     measures_per_row: int = 4,
+    beat_type: int = 4,
+    time_signature: str | None = None,
 ) -> str:
     """Render readable 4/5-line ASCII Bass TAB with chord symbols above each measure."""
+    beats_per_measure, beat_type = resolve_time_signature(
+        notes,
+        bpm=bpm,
+        time_signature=time_signature,
+        beats_per_measure=beats_per_measure,
+        beat_type=beat_type,
+    )
     strings = _strings_for_count(string_count)
-    measure_div = beats_per_measure * DIVISIONS_PER_QUARTER
-    total_measures, grid_items = _quantize_notes_to_grid(notes, bpm, beats_per_measure)
+    measure_div = _measure_divisions(beats_per_measure, beat_type)
+    total_measures, grid_items = _quantize_notes_to_grid(notes, bpm, beats_per_measure, beat_type=beat_type)
     total_measures = max(total_measures, max((c.measure_num for c in chords), default=0))
     chord_by_measure: dict[int, str] = {}
     for c in chords:

@@ -158,19 +158,24 @@ async def test_pipeline_pauses_for_bpm_confirmation_then_finalizes(
     assert pending["status"] == "needs_bpm_confirmation"
     assert pending["requires_user_confirmation"] is True
     assert pending["recommended_bpm"] == 113.0
+    assert pending["recommended_time_signature"] == "4/4"
     assert pending["song_metadata"]["canonical_artist"] == "SPYAIR"
     assert "SPYAIR" in pending["confirmation_prompt_ko"]
     assert Path(pending["files"]["bass_wav"]).is_file()
 
-    # Simulate user confirming/correcting BPM to 113.0 and generating final score from cached bass_wav.
+    # Simulate user confirming/correcting BPM to 113.0 and selecting custom time signature 3/4.
     final = audio_to_bass_score(
         audio_path=pending["files"]["bass_wav"],
         title=pending["title"],
         bpm=113.0,
+        time_signature="3/4",
     )
     assert final["status"] == "ok"
     assert final["bpm"] == 113.0
-    assert Path(final["files"]["musicxml"]).is_file()
+    assert final["time_signature"] == "3/4"
+    final_xml = ET.parse(Path(final["files"]["musicxml"])).getroot()
+    assert final_xml.findtext(".//attributes/time/beats") == "3"
+    assert final_xml.findtext(".//attributes/time/beat-type") == "4"
 
 
 def test_repeated_same_pitch_notes_split_cleanly(tmp_path: Path) -> None:

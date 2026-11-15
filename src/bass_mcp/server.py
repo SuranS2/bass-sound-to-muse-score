@@ -27,7 +27,9 @@ from bass_mcp.score_builder import (
     find_musescore_binary,
     infer_measure_chords,
     normalize_note_onsets,
+    parse_time_signature,
     render_ascii_bass_tab,
+    resolve_time_signature,
     write_midi_file,
     write_musicxml_score,
 )
@@ -100,11 +102,21 @@ def _build_score_artifacts(
     bpm: float,
     string_count: int,
     lyrics: list[Any] | None = None,
+    time_signature: str | None = None,
 ) -> dict[str, Any]:
-    shift_sec = compute_onset_shift_sec(notes, bpm=bpm, preserve_intro_bars=True)
-    aligned_notes = normalize_note_onsets(notes, bpm=bpm, preserve_intro_bars=True)
+    beats, beat_type = resolve_time_signature(
+        notes,
+        bpm=bpm,
+        time_signature=time_signature if time_signature is not None else "auto",
+    )
+    shift_sec = compute_onset_shift_sec(
+        notes, bpm=bpm, beats_per_measure=beats, preserve_intro_bars=True, beat_type=beat_type
+    )
+    aligned_notes = normalize_note_onsets(
+        notes, bpm=bpm, beats_per_measure=beats, preserve_intro_bars=True, beat_type=beat_type
+    )
     tabbed = assign_bass_tab_positions(aligned_notes, string_count=string_count)
-    chords = infer_measure_chords(tabbed, bpm=bpm)
+    chords = infer_measure_chords(tabbed, bpm=bpm, beats_per_measure=beats, beat_type=beat_type)
 
     midi_path = write_midi_file(tabbed, job_dir / "bass_line.mid", bpm=bpm)
     musicxml_path = write_musicxml_score(
@@ -114,15 +126,20 @@ def _build_score_artifacts(
         title=title,
         bpm=bpm,
         string_count=string_count,
+        beats_per_measure=beats,
         lyrics=lyrics,
         lyric_time_shift_sec=shift_sec,
+        beat_type=beat_type,
     )
-    ascii_tab = render_ascii_bass_tab(tabbed, chords, bpm=bpm, string_count=string_count)
+    ascii_tab = render_ascii_bass_tab(
+        tabbed, chords, bpm=bpm, string_count=string_count, beats_per_measure=beats, beat_type=beat_type
+    )
     mscz_path = convert_with_musescore_cli(musicxml_path, output_format="mscz")
 
     return {
         "tabbed_notes": tabbed,
         "chords": [{"measure": c.measure_num, "symbol": c.symbol} for c in chords],
+        "time_signature": f"{beats}/{beat_type}",
         "midi_path": midi_path,
         "musicxml_path": musicxml_path,
         "mscz_path": mscz_path,
@@ -226,13 +243,16 @@ async def transcribe_bass_pipeline(
     string_count: int = 4,
     send_to_musescore: bool = False,
     auto_confirm_bpm: bool = False,
+    time_signature: str | None = None,
 ) -> dict[str, Any]:
     """Convert a YouTube URL or local audio file into Bass MusicXML, 4/5-string TAB, chords, and MIDI.
 
     When bpm is omitted and auto_confirm_bpm is False, extracts song metadata, isolates the bass stem,
     checks public BPM lookup, and returns status='needs_bpm_confirmation' so the user can confirm or
-    correct 'song_title - artist' and BPM before generating final score files with audio_to_bass_score.
+    correct 'song_title - artist', BPM, and time_signature ('4/4', '3/4', '6/8', or 'auto') before
+    generating final score files with audio_to_bass_score.
     """
+    parse_time_signature(time_signature)
     min_midi = _min_midi_for_strings(string_count)
     job_dir = prepare_job_output_dir(_get_output_root())
 
@@ -261,6 +281,12 @@ async def transcribe_bass_pipeline(
             job_dir, canonical_title, canonical_artist, (acq, "wav_path"), (sep, "bass_wav")
         )
         suggested_bpm = web_lookup["bpm"] if web_lookup.get("bpm") else trans["estimated_bpm"]
+        rec_beats, rec_beat_type = resolve_time_signature(
+            trans["notes"],
+            bpm=float(suggested_bpm),
+            time_signature=time_signature if time_signature is not None else "auto",
+        )
+        rec_time_sig = f"{rec_beats}/{rec_beat_type}"
         return {
             "status": "needs_bpm_confirmation",
             "requires_user_confirmation": True,
@@ -279,6 +305,7 @@ async def transcribe_bass_pipeline(
             "audio_estimated_bpm": trans["estimated_bpm"],
             "web_bpm_lookup": web_lookup,
             "recommended_bpm": suggested_bpm,
+            "recommended_time_signature": rec_time_sig,
             "engines": {
                 "separator": sep["engine"],
                 "transcriber": trans["engine"],
@@ -291,14 +318,16 @@ async def transcribe_bass_pipeline(
             "confirmation_prompt_ko": (
                 f"감지된 곡 명-가수: {display_name}\n"
                 f"추정 BPM: {suggested_bpm} BPM (오디오 자동 추정: {trans['estimated_bpm']} BPM)\n"
-                "원본 곡 명-가수와 BPM이 맞는지 확인해 주세요. 틀렸다면 수정할 곡명이나 BPM을 입력해 주세요."
+                f"추천 박자표: {rec_time_sig} (선택하지 않으면 AI 자동 추정 적용)\n"
+                "원본 곡 명-가수, BPM, 박자표가 맞는지 확인해 주세요. 수정할 항목이 있다면 입력해 주세요."
             ),
             "next_step_instructions": (
                 "If this track has an original release and web_bpm_lookup.bpm is null, run a web search "
                 "using web_bpm_lookup.web_search_query to check the original BPM. Then present the song "
-                "name - artist and BPM to the user, ask for confirmation or a corrected BPM, and call "
-                "audio_to_bass_score(audio_path=files['bass_wav'], title=<confirmed_title>, "
-                "bpm=<confirmed_bpm>, string_count=...) to finalize the score."
+                "name - artist, BPM, and recommended_time_signature to the user, ask for confirmation or "
+                "a corrected BPM / time_signature, and call audio_to_bass_score(audio_path=files['bass_wav'], "
+                "title=<confirmed_title>, bpm=<confirmed_bpm>, string_count=..., time_signature=<chosen or None>) "
+                "to finalize the score."
             ),
         }
 
@@ -319,6 +348,7 @@ async def transcribe_bass_pipeline(
         bpm=effective_bpm,
         string_count=string_count,
         lyrics=lyric_lines,
+        time_signature=time_signature,
     )
 
     push_result: dict[str, Any] | None = None
@@ -336,6 +366,7 @@ async def transcribe_bass_pipeline(
         "source_ref": acq["source_ref"],
         "duration_sec": acq["duration_sec"],
         "bpm": effective_bpm,
+        "time_signature": scored["time_signature"],
         "string_count": string_count,
         "engines": {
             "separator": sep["engine"],
@@ -395,8 +426,10 @@ def audio_to_bass_score(
     title: str = "Bass Score",
     bpm: float | None = None,
     string_count: int = 4,
+    time_signature: str | None = None,
 ) -> dict[str, Any]:
     """Convert an already-isolated local bass audio file into MusicXML, TAB, chords, and MIDI."""
+    parse_time_signature(time_signature)
     if is_uri_input(audio_path):
         raise SecurityValidationError("audio_to_bass_score accepts local file paths only, not URLs.")
     allowed_dirs = _effective_allowed_dirs()
@@ -430,6 +463,7 @@ def audio_to_bass_score(
         bpm=effective_bpm,
         string_count=string_count,
         lyrics=lyric_lines,
+        time_signature=time_signature,
     )
     tabbed: list[TabbedBassNote] = scored["tabbed_notes"]
 
@@ -439,6 +473,7 @@ def audio_to_bass_score(
         "job_dir": str(job_dir),
         "duration_sec": acq["duration_sec"],
         "bpm": effective_bpm,
+        "time_signature": scored["time_signature"],
         "string_count": string_count,
         "engine": trans["engine"],
         "files": {
