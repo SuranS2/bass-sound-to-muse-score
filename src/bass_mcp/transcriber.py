@@ -337,7 +337,7 @@ def _transcribe_librosa_pyin(
     onset_frames = {
         int(x)
         for x in librosa.onset.onset_detect(
-            y=audio, sr=sr, hop_length=hop, backtrack=False, delta=0.03
+            y=audio, sr=sr, hop_length=hop, backtrack=False, delta=0.03, wait=4
         )
     }
     n = min(len(f0), len(rms))
@@ -345,6 +345,14 @@ def _transcribe_librosa_pyin(
     for i in range(n):
         if voiced_flag[i] and np.isfinite(f0[i]):
             midi_frames[i] = int(round(hz_to_midi(float(f0[i]))))
+
+    # Compensate for 2048-sample pYIN window lag (1-3 frames) behind sharp pluck transients.
+    for i in range(3, n):
+        if midi_frames[i] >= min_midi and midi_frames[i - 1] < min_midi:
+            for back in (3, 2, 1):
+                if (i - back) in onset_frames and rms[i - back] >= 0.25 * rms[i]:
+                    midi_frames[i - back : i] = midi_frames[i]
+                    break
 
     notes = _segments_from_frame_pitches(
         midi_frames=midi_frames,
