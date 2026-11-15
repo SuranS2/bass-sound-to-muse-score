@@ -141,6 +141,7 @@ def _segments_from_frame_pitches(
     min_midi: int,
     max_midi: int,
     min_note_len_sec: float,
+    onset_frames: set[int] | None = None,
 ) -> list[BassNote]:
     """Group quantized per-frame MIDI values into monophonic BassNote events."""
     valid = (midi_frames >= min_midi) & (midi_frames <= max_midi)
@@ -191,13 +192,23 @@ def _segments_from_frame_pitches(
             seg_rms = []
             continue
 
-        # Detect re-articulated repeated note if RMS drops to a sharp valley then rises.
-        reattack = (
-            p == current_pitch
-            and len(seg_rms) >= 3
-            and seg_rms[-1] < 0.35 * max(seg_rms[:-1])
-            and r > 1.6 * seg_rms[-1]
-        )
+        # Detect re-articulated repeated note via onset event or RMS dip valley.
+        if onset_frames is not None:
+            reattack = (
+                p == current_pitch
+                and len(seg_rms) >= 4
+                and (
+                    idx in onset_frames
+                    or (seg_rms[-1] < 0.55 * max(seg_rms[:-1]) and r > 1.3 * seg_rms[-1])
+                )
+            )
+        else:
+            reattack = (
+                p == current_pitch
+                and len(seg_rms) >= 3
+                and seg_rms[-1] < 0.35 * max(seg_rms[:-1])
+                and r > 1.6 * seg_rms[-1]
+            )
         if p != current_pitch or reattack:
             _flush(idx)
             current_pitch = p
@@ -322,7 +333,13 @@ def _transcribe_librosa_pyin(
         sr=sr,
         hop_length=hop,
     )
-    rms = librosa.feature.rms(y=audio, hop_length=hop)[0]
+    rms = librosa.feature.rms(y=audio, frame_length=1024, hop_length=hop)[0]
+    onset_frames = {
+        int(x)
+        for x in librosa.onset.onset_detect(
+            y=audio, sr=sr, hop_length=hop, backtrack=False, delta=0.05
+        )
+    }
     n = min(len(f0), len(rms))
     midi_frames = np.full(n, -1, dtype=np.int32)
     for i in range(n):
@@ -336,11 +353,12 @@ def _transcribe_librosa_pyin(
         min_midi=min_midi,
         max_midi=max_midi,
         min_note_len_sec=min_note_len_sec,
+        onset_frames=onset_frames,
     )
-    return _clean_transcribed_notes(notes)
+    return _clean_transcribed_notes(notes, min_velocity=50)
 
 
-def _clean_transcribed_notes(notes: list[BassNote]) -> list[BassNote]:
+def _clean_transcribed_notes(notes: list[BassNote], min_velocity: int = 66) -> list[BassNote]:
     """Filter low-energy bleed/harmonic ghosts and merge micro-split same-pitch plucks."""
     if not notes:
         return []
@@ -348,7 +366,7 @@ def _clean_transcribed_notes(notes: list[BassNote]) -> list[BassNote]:
     max_vel = max(n.velocity for n in notes)
     filtered: list[BassNote] = []
     for n in notes:
-        if max_vel >= 75 and n.velocity < 66:
+        if max_vel >= 75 and n.velocity < min_velocity:
             continue
         if n.pitch_midi >= 50 and (n.velocity < 78 or n.duration_sec < 0.11):
             continue

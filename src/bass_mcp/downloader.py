@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import sys
 import wave
@@ -11,6 +12,7 @@ import numpy as np
 from scipy.io import wavfile
 from scipy.signal import resample_poly
 
+from bass_mcp.metadata import parse_song_artist
 from bass_mcp.security import (
     SecurityValidationError,
     SubprocessExecutionError,
@@ -77,7 +79,28 @@ def _convert_to_wav_ffmpeg(src_path: Path, dst_wav: Path) -> None:
     )
 
 
-def _download_youtube_audio(canonical_url: str, job_dir: Path, max_duration_sec: int) -> Path:
+def _read_ytdlp_song_metadata(job_dir: Path, fallback_id: str) -> dict[str, str]:
+    info_files = sorted(job_dir.glob("yt_download*.info.json"))
+    for info_path in info_files:
+        if info_path.is_symlink() or not info_path.is_file():
+            continue
+        if info_path.stat().st_size > 5 * 1024 * 1024:
+            continue
+        try:
+            payload = json.loads(info_path.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict):
+            return parse_song_artist(
+                raw_title=str(payload.get("title") or fallback_id),
+                uploader=str(payload.get("uploader") or payload.get("channel") or ""),
+                track=str(payload.get("track") or ""),
+                artist=str(payload.get("artist") or ""),
+            )
+    return parse_song_artist(raw_title=fallback_id)
+
+
+def _download_youtube_audio(canonical_url: str, job_dir: Path, max_duration_sec: int) -> tuple[Path, dict[str, str]]:
     """Download audio from a canonicalized YouTube URL using yt-dlp in an isolated subprocess."""
     ffmpeg_bin = shutil.which("ffmpeg")
     if not ffmpeg_bin:
@@ -89,6 +112,7 @@ def _download_youtube_audio(canonical_url: str, job_dir: Path, max_duration_sec:
         "-m",
         "yt_dlp",
         "--no-playlist",
+        "--write-info-json",
         "--max-filesize",
         "100M",
         "--match-filter",
@@ -115,7 +139,8 @@ def _download_youtube_audio(canonical_url: str, job_dir: Path, max_duration_sec:
     downloaded_wav = candidates[0]
     normalized_wav = job_dir / "source_audio.wav"
     _convert_to_wav_ffmpeg(downloaded_wav, normalized_wav)
-    return normalized_wav
+    song_meta = _read_ytdlp_song_metadata(job_dir, fallback_id=canonical_url)
+    return normalized_wav, song_meta
 
 
 def acquire_audio(
@@ -133,7 +158,7 @@ def acquire_audio(
 
     if is_uri_input(cleaned) or cleaned.startswith("-"):
         video_id, canonical_url = validate_youtube_url(cleaned)
-        wav_path = _download_youtube_audio(canonical_url, job_dir, max_duration_sec)
+        wav_path, song_meta = _download_youtube_audio(canonical_url, job_dir, max_duration_sec)
         source_type = "youtube"
         source_ref = canonical_url
         meta_id = video_id
@@ -151,6 +176,7 @@ def acquire_audio(
         source_type = "local_file"
         source_ref = str(local_path)
         meta_id = local_path.stem
+        song_meta = parse_song_artist(raw_title=local_path.stem)
 
     duration_sec = _read_wav_duration_seconds(wav_path)
     if duration_sec <= 0:
@@ -167,4 +193,5 @@ def acquire_audio(
         "wav_path": wav_path,
         "sample_rate": TARGET_SAMPLE_RATE,
         "duration_sec": round(duration_sec, 3),
+        "song_metadata": song_meta,
     }
