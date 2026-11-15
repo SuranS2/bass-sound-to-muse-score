@@ -1,5 +1,12 @@
 # bass-sound-to-muse-score (`bass-mcp`)
 
+> [!IMPORTANT]
+> **이용 목적 및 저작권 책임 안내 (필독)**
+> - **서비스 목적:** 본 도구는 개인 합주·연습 준비를 위한 **베이스 악보 초안(Draft) 작성 보조 툴**입니다. (완전한 출판용 정본 악보 제작 도구가 아닙니다.)
+> - **개인 사용 한정 (사적이용 복제):** 본 도구로 추출한 악보 및 **Browser Use / Computer Use(유튜브 영상 화면 캡처 보정)** 결과물은 **대한민국 저작권법 제30조(사적이용을 위한 복제)** 범위 내 **개인 연습·연구 목적**으로만 사용해야 합니다.
+> - **사용자 책임 명시:** 저작권이 있는 음원을 바탕으로 악보를 생성하거나, 타인의 유튜브 TAB/편곡(저작권법 제5조 **2차적저작물**)을 참조·보정하여 생성한 악보를 **블로그·카페·커뮤니티·오픈채팅 등에 업로드·공유·배포·전송·판매함으로써 발생하는 모든 저작권 분쟁 및 법적 책임은 전적으로 사용자 본인에게 있습니다.**
+> - **오탐 방지 방침:** 화음/더블스톱 추정은 오탐 위험이 있어 의도적으로 제외하고, 단선율 기반 베이스 라인 정확도와 반복 마디 안정화에 집중합니다.
+
 로컬에서 실행되는 **MCP (Model Context Protocol) 서버 번들**입니다.  
 유튜브 링크나 로컬 음원 파일을 입력하면 **베이스 트랙 분리 → MIDI/음표 채보 → 코드 추정 → 4현/5현 베이스 TAB + 오선 악보(MusicXML / MIDI / MuseScore `.mscz`)** 로 자동 변환합니다.
 
@@ -56,6 +63,9 @@ cd bass-sound-to-muse-score
 # 가상환경(.venv) 생성 및 고품질 ML 엔진(Demucs + Librosa pYIN) 설치
 python -m venv .venv
 .venv\Scripts\pip install -e ".[ml]"
+
+# (선택) 원음 기반 다운비트 정밀 추적 Beat This! 추가 설치 (CPJKU/beat_this, MIT)
+# .venv\Scripts\pip install -e ".[ml,beat]"
 ```
 
 *(macOS / Linux에서는 마지막 줄 대신 `.venv/bin/pip install -e ".[ml]"`를 사용하세요. 가벼운 기본 모드만 필요하면 `-e .`로 설치할 수 있으며, Python 3.10~3.11에서는 `basic-pitch`도 함께 설치되고 Python 3.12+에서는 자동으로 `demucs` + `librosa:pyin` 엔진으로 동작합니다.)*
@@ -141,10 +151,13 @@ claude mcp add --transport stdio bass-sound-to-musescore -e BASS_MCP_OUTPUT_DIR=
    > `베이스 MCP 환경 상태 확인해줘`
 2. **유튜브 또는 음원 파일로 타브 악보 요청:**
    > `https://www.youtube.com/watch?v=Pxn4J9DyQZA 이 곡 베이스 타브 악보 뽑아줘`
-3. **곡명·원본 BPM 확인 응답:**
-   AI가 웹에서 조회한 곡명과 원본 BPM(예: `SPYAIR - Some Like It Hot, 113 BPM`)을 먼저 확인해 주면 그대로 진행하거나 수정 BPM을 알려줍니다.
-   > `응 113 BPM 맞아, 그대로 변환해줘` *(틀릴 경우 예: `원곡 118 BPM이야, 이걸로 뽑아줘`)*
-4. **결과물 확인:** `output/job_.../` 폴더에 생성된 `bass_score.mscz` (또는 `bass_score.musicxml`, `bass_line.mid`)를 **MuseScore 4**로 열면 전주/간주 쉼표가 유지된 오선보 + 4현/5현 TAB + 코드 기호를 바로 확인할 수 있습니다.
+3. **곡명·원본 BPM·박자표·도돌이표 압축·화면 보정 확인 응답:**
+   AI가 조회한 곡명과 원본 BPM(예: `SPYAIR - Some Like It Hot, 113 BPM`), 추천 박자표(예: `4/4`)를 먼저 확인해 주며 다음 항목을 함께 질문합니다:
+   - **`4/4`·`3/4`·`6/8` 외에 `5/4`·`7/8`·`12/8` 같은 변칙/복합박자는 `time_signature` 직접 지정 필요**
+   - **도돌이표 압축 여부 (`compress_repeats`):** 기본값은 풀 스코어(`False`, 전체 마디 전개)이며, 반복 마디를 도돌이표(`|xN`)로 줄이려면 `True` 선택
+   - **(선택, 개인 사용 한정) Browser Use / Computer Use 화면 보정:** AI 툴에 브라우저/화면 제어 기능이 있다면 유튜브 영상 TAB을 참고(`prepare_youtube_tab_frames` → `visual_tab_hints`)하여 프렛 위치·전주 쉼표·슬라이드를 보정 가능
+   > `응 113 BPM, 4/4 풀스코어로 그대로 변환해줘` *(예: `118 BPM, 7/8 박자, 도돌이표 압축 켜고 뽑아줘`)*
+4. **결과물 확인:** `output/<곡명>-<가수>-.../` 폴더에 생성된 `bass_score.mscz` (또는 `bass_score.musicxml`, `bass_line.mid`)를 **MuseScore 4**로 열면 전주/간주 쉼표·스타카토·슬라이드가 반영된 오선보 + 4현/5현 TAB + 코드 기호를 바로 확인할 수 있습니다.
 
 ---
 
@@ -152,24 +165,29 @@ claude mcp add --transport stdio bass-sound-to-musescore -e BASS_MCP_OUTPUT_DIR=
 
 | Tool | 설명 |
 |---|---|
-| `transcribe_bass_pipeline` | 유튜브 URL 또는 로컬 음원 → 곡명/가수·BPM 확인 요청(미확정 시 `needs_bpm_confirmation`) 후 코드/TAB/MusicXML/MIDI/MSCZ 생성 |
+| `transcribe_bass_pipeline` | 유튜브 URL 또는 로컬 음원 → 곡명/가수·BPM·박자표·도돌이표 압축 확인 요청(`needs_bpm_confirmation`) 후 코드/TAB/MusicXML/MIDI/MSCZ 생성 |
 | `lookup_song_bpm` | 허용된 공개 음악 API(`iTunes`/`Deezer`)로 곡명-가수 정규화 및 원본 BPM 조회 |
 | `separate_bass_track` | 유튜브 URL 또는 음원에서 베이스 트랙 WAV만 분리 |
-| `audio_to_bass_score` | 이미 분리된 베이스 오디오 파일을 확정된 BPM/제목으로 악보(`.musicxml`, `.mid`, ASCII TAB) 변환 |
+| `audio_to_bass_score` | 이미 분리된 베이스 오디오를 확정된 BPM·박자표·`compress_repeats`·`visual_tab_hints`로 악보 변환 |
+| `prepare_youtube_tab_frames` | *(개인 연습 보정용)* 유튜브 영상에서 제한된 수(`1~24`장)의 TAB 키프레임을 추출하고 `visual_tab_hints` 스키마·Browser/Computer Use 가이드를 반환 |
 | `musescore_live_push` | 생성된 노트 JSON 또는 MusicXML을 실행 중인 MuseScore 4로 전송 (`127.0.0.1:8765`) |
-| `check_environment_status` | `ffmpeg`, `yt-dlp`, `demucs`, `basic-pitch`, MuseScore CLI 설치 상태 및 라이선스 정보 확인 |
+| `check_environment_status` | `ffmpeg`, `yt-dlp`, `demucs`, `basic-pitch`, `beat_this`, MuseScore CLI 설치 상태 및 라이선스 정보 확인 |
 
 ---
 
 ## Public 공개 가능 여부 및 오픈소스 라이선스 안내
 
 - **GitHub Public 저장소 공개 가능 여부:** **공개 가능(안전)**. 본 프로젝트 코드는 **MIT License**이며, 핵심 Python 의존성도 모두 MIT/BSD/ISC/Apache-2.0/Unlicense 등 퍼미시브 라이선스입니다. GPL-3.0인 **MuseScore 4**와 **FFmpeg**는 코드를 링크하거나 동봉하지 않고 사용자 PC에 설치된 별도 실행 파일을 외부 CLI 서브프로세스로만 호출하므로(FSF GPLv3 FAQ의 별개 프로그램 기준), 본 저장소 코드에 GPL이 전파되지 않습니다.
+- **Demucs (`facebookresearch/demucs`) 라이선스 정밀 검토 결과:**
+  - **소스 코드 및 추론 프레임워크:** **MIT License** (상업·개인·수정·배포 허용).
+  - **사전학습 모델 가중치(`htdemucs`, `mdx` 등):** MIT 라이선스 적용 대상이 아니며, **MUSDB18 / MUSDB18-HQ** 등 연구·비상업 데이터셋 약관의 영향을 받아 업스트림 메인테이너 기준 **개인·비상업·연구 목적(non-commercial / research only)**으로 취급됩니다. 본 저장소에는 Demucs 가중치를 직접 동봉하지 않으며, 사용자가 선택 설치(`[ml]`) 시 로컬 환경에서만 내려받아 개인 용도로 실행합니다. 상업용 제품/서비스에 `htdemucs` 가중치를 번들링·배포하려면 별도 법률·라이선스 검토 또는 자체 학습 모델 교체가 필요합니다.
 - **공개 시 주의사항:**
-  - `.gitignore`에 이미 포함된 `output/`, `*.wav`, `*.mp3`, `*.mid`, `*.musicxml`, `*.mscz` 등 **유튜브 다운로드 음원 및 생성 악보 파일(원곡 저작물 파생물)과 Demucs 사전학습 모델 가중치는 저장소에 커밋하지 마세요.**
+  - `.gitignore`에 이미 포함된 `output/`, `*.wav`, `*.mp3`, `*.mid`, `*.musicxml`, `*.mscz`, `*.jpg` 등 **유튜브 다운로드 음원·캡처 프레임 및 생성 악보 파일(원곡 저작물 파생물)과 Demucs 사전학습 모델 가중치는 저장소에 커밋하지 마세요.**
   - 자세한 전문과 출처 고지는 [LICENSE](LICENSE), [NOTICE](NOTICE), [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)를 참고하세요.
 
 - **Spotify Basic Pitch** (`spotify/basic-pitch`) — Apache License 2.0
-- **Meta / Facebook Research Demucs** (`facebookresearch/demucs`) — MIT License (사전학습 모델 가중치는 별도 데이터셋 약관 확인 필요)
+- **Meta / Facebook Research Demucs** (`facebookresearch/demucs`) — 코드 MIT License / 사전학습 가중치(`htdemucs` 등) 비상업·연구·개인 목적 한정
+- **Beat This!** (`CPJKU/beat_this`) — 코드 및 모델 가중치 MIT License (학습 원음 데이터셋 별도 저작권 유의)
 - **librosa** (`librosa/librosa`) — ISC License
 - **NumPy / SciPy / websockets** — BSD 3-Clause License
 - **ghchen99/mcp-musescore** (`ghchen99/mcp-musescore`) — MIT License

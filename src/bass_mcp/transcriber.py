@@ -40,6 +40,61 @@ def has_librosa() -> bool:
     return importlib.util.find_spec("librosa") is not None
 
 
+def has_beat_this() -> bool:
+    """Return True if CPJKU/beat_this is installed."""
+    return importlib.util.find_spec("beat_this") is not None
+
+
+def detect_audio_downbeats(audio_wav: Path) -> tuple[list[float], list[float]]:
+    """Optionally detect (beats, downbeats) timestamps via CPJKU/beat_this when installed."""
+    if not has_beat_this() or not audio_wav.is_file():
+        return [], []
+    try:
+        from beat_this.inference import File2Beats
+
+        beats, downbeats = File2Beats()(str(audio_wav))
+        return [float(x) for x in beats], [float(x) for x in downbeats]
+    except Exception:
+        return [], []
+
+
+def estimate_track_start_sec(audio_wav: Path | None) -> float:
+    """Estimate first audible musical sound / beat in the full mix (clamped to [0, 15]s)."""
+    if audio_wav is None or not Path(audio_wav).is_file():
+        return 0.0
+    try:
+        audio, sr = _load_mono_audio(Path(audio_wav), target_sr=22050)
+    except Exception:
+        return 0.0
+
+    win, hop = 1024, 512
+    n_frames = (len(audio) - win) // hop + 1
+    if n_frames < 3:
+        return 0.0
+
+    rms = np.array(
+        [float(np.sqrt(np.mean(audio[i * hop : i * hop + win] ** 2))) for i in range(n_frames)],
+        dtype=np.float32,
+    )
+    peak = float(np.max(rms))
+    if peak < 1e-4:
+        return 0.0
+
+    thresh = max(peak * 0.06, 1e-4)
+    first_rms_sec = 0.0
+    for i in range(n_frames - 2):
+        if rms[i] >= thresh and rms[i + 1] >= thresh and rms[i + 2] >= thresh:
+            first_rms_sec = (i * hop) / float(sr)
+            break
+
+    start_sec = first_rms_sec
+    if has_beat_this():
+        beats, _ = detect_audio_downbeats(Path(audio_wav))
+        if beats:
+            start_sec = min(float(beats[0]), first_rms_sec)
+    return round(max(0.0, min(15.0, float(start_sec))), 4)
+
+
 def midi_to_note_name(midi_num: int) -> str:
     """Convert an integer MIDI pitch to scientific pitch notation (e.g. 28 -> 'E1')."""
     octave = (midi_num // 12) - 1

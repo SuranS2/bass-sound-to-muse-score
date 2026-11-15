@@ -195,3 +195,89 @@ def acquire_audio(
         "duration_sec": round(duration_sec, 3),
         "song_metadata": song_meta,
     }
+
+
+def extract_youtube_tab_keyframes(
+    source: str,
+    job_dir: Path,
+    interval_sec: float = 4.0,
+    max_frames: int = 12,
+    max_duration_sec: int = 900,
+) -> dict:
+    """Validate a YouTube URL and optionally extract bounded JPG keyframes for visual TAB inspection."""
+    _, canonical_url = validate_youtube_url(source)
+    if isinstance(interval_sec, bool) or not isinstance(interval_sec, (int, float)) or not (1.0 <= float(interval_sec) <= 60.0):
+        raise SecurityValidationError("interval_sec must be between 1.0 and 60.0.")
+    if isinstance(max_frames, bool) or not isinstance(max_frames, int) or not (1 <= max_frames <= 24):
+        raise SecurityValidationError("max_frames must be an integer between 1 and 24.")
+    if max_duration_sec <= 0:
+        raise SecurityValidationError("max_duration_sec must be positive.")
+
+    frames_dir = job_dir / "tab_frames"
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    frames: list[str] = []
+    note = ""
+
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if not ffmpeg_bin:
+        note = "ffmpeg unavailable; inspect canonical_url with Browser Use or Computer Use directly."
+    else:
+        video_template = str(job_dir / "yt_video.%(ext)s")
+        try:
+            run_safe_command(
+                [
+                    sys.executable,
+                    "-m",
+                    "yt_dlp",
+                    "--no-playlist",
+                    "--max-filesize",
+                    "100M",
+                    "--match-filter",
+                    f"duration <= {int(max_duration_sec)}",
+                    "-f",
+                    "bestvideo[height<=720][ext=mp4]/best[height<=720]/bestvideo[height<=720]",
+                    "-o",
+                    video_template,
+                    "--",
+                    canonical_url,
+                ],
+                timeout=300,
+                cwd=job_dir,
+            )
+            video_files = [p for p in sorted(job_dir.glob("yt_video.*")) if p.is_file() and not p.is_symlink()]
+            if video_files:
+                video_path = video_files[0]
+                try:
+                    run_safe_command(
+                        [
+                            ffmpeg_bin,
+                            "-y",
+                            "-v",
+                            "error",
+                            "-i",
+                            str(video_path),
+                            "-vf",
+                            f"fps=1/{float(interval_sec):.3f}",
+                            "-frames:v",
+                            str(int(max_frames)),
+                            "-q:v",
+                            "4",
+                            str(frames_dir / "tab_%03d.jpg"),
+                        ],
+                        timeout=180,
+                    )
+                finally:
+                    for vf in video_files:
+                        vf.unlink(missing_ok=True)
+                frames = [str(p) for p in sorted(frames_dir.glob("tab_*.jpg")) if p.is_file()]
+            else:
+                note = "Video stream unavailable; inspect canonical_url via Browser Use or Computer Use."
+        except (SubprocessExecutionError, OSError):
+            note = "Video frame capture skipped/unavailable; inspect canonical_url via Browser Use or Computer Use."
+
+    return {
+        "canonical_url": canonical_url,
+        "frames_dir": str(frames_dir),
+        "frames": frames,
+        "note": note,
+    }

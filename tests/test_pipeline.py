@@ -14,6 +14,7 @@ from bass_mcp.security import SecurityValidationError
 from bass_mcp.server import (
     audio_to_bass_score,
     check_environment_status,
+    prepare_youtube_tab_frames,
     separate_bass_track,
     transcribe_bass_pipeline,
 )
@@ -107,10 +108,17 @@ def test_separate_and_audio_to_score_tools(
 def test_check_environment_status() -> None:
     status = check_environment_status()
     assert status["status"] == "ok"
+    assert "beat_this" in status["dependencies"]
     projects = {item["project"] for item in status["attributions"]}
     assert "spotify/basic-pitch" in projects
     assert "facebookresearch/demucs" in projects
+    assert "CPJKU/beat_this" in projects
     assert "ghchen99/mcp-musescore" in projects
+
+    with pytest.raises(SecurityValidationError):
+        prepare_youtube_tab_frames(source="http://www.youtube.com/watch?v=dQw4w9WgXcQ")
+    with pytest.raises(SecurityValidationError):
+        prepare_youtube_tab_frames(source="https://www.youtube.com/watch?v=dQw4w9WgXcQ", max_frames=99)
 
 
 def test_parse_song_artist_and_lookup_security() -> None:
@@ -159,23 +167,34 @@ async def test_pipeline_pauses_for_bpm_confirmation_then_finalizes(
     assert pending["requires_user_confirmation"] is True
     assert pending["recommended_bpm"] == 113.0
     assert pending["recommended_time_signature"] == "4/4"
+    assert pending["recommended_compress_repeats"] is False
+    assert pending["auto_time_signature_candidates"] == ["4/4", "3/4", "6/8"]
+    assert "5/4" in pending["time_signature_notice_ko"]
+    assert "5/4" in pending["confirmation_prompt_ko"]
+    assert "제30조" in pending["copyright_notice_ko"]
     assert pending["song_metadata"]["canonical_artist"] == "SPYAIR"
     assert "SPYAIR" in pending["confirmation_prompt_ko"]
     assert Path(pending["files"]["bass_wav"]).is_file()
 
-    # Simulate user confirming/correcting BPM to 113.0 and selecting custom time signature 3/4.
+    # Simulate user confirming BPM, custom 3/4, repeat compression, and visual TAB fret override.
     final = audio_to_bass_score(
         audio_path=pending["files"]["bass_wav"],
         title=pending["title"],
         bpm=113.0,
         time_signature="3/4",
+        compress_repeats=True,
+        visual_tab_hints='{"measures": {"1": ["3:5"]}}',
     )
     assert final["status"] == "ok"
     assert final["bpm"] == 113.0
     assert final["time_signature"] == "3/4"
+    assert final["compress_repeats"] is True
+    assert "제30조" in final["copyright_notice_ko"]
     final_xml = ET.parse(Path(final["files"]["musicxml"])).getroot()
     assert final_xml.findtext(".//attributes/time/beats") == "3"
     assert final_xml.findtext(".//attributes/time/beat-type") == "4"
+    assert final_xml.findtext(".//measure[@number='1']//technical/string") == "3"
+    assert final_xml.findtext(".//measure[@number='1']//technical/fret") == "5"
 
 
 def test_repeated_same_pitch_notes_split_cleanly(tmp_path: Path) -> None:

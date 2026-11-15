@@ -3,16 +3,17 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import re
 import shutil
 import struct
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from bass_mcp.security import SecurityValidationError, run_safe_command
-from bass_mcp.transcriber import BassNote
+from bass_mcp.transcriber import BassNote, midi_to_note_name
 
 DIVISIONS_PER_QUARTER = 4  # 16th-note grid
 _TIME_SIG_RE = re.compile(r"^\s*(\d{1,2})\s*/\s*(2|4|8|16)\s*$")
@@ -103,6 +104,8 @@ class TabbedBassNote:
     string_num: int
     fret: int
     pitch_bend: int = 0
+    staccato: bool = False
+    slide: bool = False
 
 
 @dataclass(frozen=True)
@@ -288,8 +291,15 @@ def compute_onset_shift_sec(
     beats_per_measure: int = 4,
     preserve_intro_bars: bool = False,
     beat_type: int = 4,
+    track_start_sec: float = 0.0,
+    intro_rest_bars_override: int | None = None,
 ) -> float:
     """Return leading time shift (seconds) aligning downbeats (including pickups) to bar boundaries."""
+    if intro_rest_bars_override is not None:
+        if isinstance(intro_rest_bars_override, bool) or not isinstance(intro_rest_bars_override, int):
+            raise SecurityValidationError("intro_rest_bars must be an integer.")
+        if not (0 <= intro_rest_bars_override <= 64):
+            raise SecurityValidationError("intro_rest_bars must be between 0 and 64.")
     if not notes:
         return 0.0
     t0 = min(n.onset_sec for n in notes)
@@ -298,9 +308,13 @@ def compute_onset_shift_sec(
         q_beats = _quarter_beats_per_measure(beats_per_measure, beat_type)
         measure_sec = q_beats * beat_sec
         t_db = _detect_riff_downbeat_sec(notes, bpm=bpm, quarter_beats_per_measure=q_beats)
+        if intro_rest_bars_override is not None:
+            return t_db - int(intro_rest_bars_override) * measure_sec
+
+        lead_sec = max(0.0, float(track_start_sec)) if 0.0 < track_start_sec < t0 - 0.2 * measure_sec else 0.0
         if (t_db - t0) >= 0.15 * beat_sec and (t_db - t0) < measure_sec:
             if preserve_intro_bars:
-                target_bars = max(1, int(round(t_db / measure_sec)))
+                target_bars = max(1, int(round((t_db - lead_sec) / measure_sec)))
                 if t0 - (t_db - target_bars * measure_sec) < 0.0:
                     target_bars += 1
             else:
@@ -308,14 +322,15 @@ def compute_onset_shift_sec(
             return t_db - target_bars * measure_sec
 
         if preserve_intro_bars:
-            if t0 < 0.75 * measure_sec:
+            eff_t0 = max(0.0, t0 - lead_sec)
+            if eff_t0 < 0.75 * measure_sec:
                 return t0 if t0 > min_trim_sec else 0.0
-            bars_raw = t0 / measure_sec
+            bars_raw = eff_t0 / measure_sec
             frac = bars_raw - int(bars_raw)
             if frac <= 0.40 or frac >= 0.85:
                 intro_bars = max(0, int(round(bars_raw)))
                 return t0 - intro_bars * measure_sec
-            return 0.0
+            return lead_sec
     return t0 if t0 > min_trim_sec else 0.0
 
 
@@ -326,6 +341,8 @@ def normalize_note_onsets(
     beats_per_measure: int = 4,
     preserve_intro_bars: bool = False,
     beat_type: int = 4,
+    track_start_sec: float = 0.0,
+    intro_rest_bars_override: int | None = None,
 ) -> list[BassNote]:
     """Shift leading silence while preserving pickups and integer intro rest bars."""
     if not notes:
@@ -338,6 +355,8 @@ def normalize_note_onsets(
         beats_per_measure=beats_per_measure,
         preserve_intro_bars=preserve_intro_bars,
         beat_type=beat_type,
+        track_start_sec=track_start_sec,
+        intro_rest_bars_override=intro_rest_bars_override,
     )
     if abs(shift) < 1e-4:
         return ordered
@@ -501,6 +520,137 @@ def assign_bass_tab_positions(
             )
         )
     return tabbed
+
+
+_VISUAL_HINT_COORD_RE = re.compile(r"^\s*(\d+)\s*:\s*(\d+)\s*$")
+_MAX_VISUAL_HINTS_BYTES = 262144
+
+
+def _parse_visual_hints_dict(visual_tab_hints: str | dict | None) -> dict | None:
+    if visual_tab_hints is None:
+        return None
+    if isinstance(visual_tab_hints, str):
+        raw = visual_tab_hints.strip()
+        if not raw:
+            return None
+        if len(raw.encode("utf-8")) > _MAX_VISUAL_HINTS_BYTES:
+            raise SecurityValidationError("visual_tab_hints exceeds 256 KB limit.")
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise SecurityValidationError(f"visual_tab_hints must be valid JSON: {exc.msg}") from exc
+    elif isinstance(visual_tab_hints, dict):
+        data = visual_tab_hints
+    else:
+        raise SecurityValidationError("visual_tab_hints must be a JSON string or object.")
+    if not isinstance(data, dict):
+        raise SecurityValidationError("visual_tab_hints root must be a JSON object.")
+
+    if "intro_rest_bars" in data and data["intro_rest_bars"] is not None:
+        bars = data["intro_rest_bars"]
+        if isinstance(bars, bool) or not isinstance(bars, int) or not (0 <= bars <= 64):
+            raise SecurityValidationError("visual_tab_hints.intro_rest_bars must be an integer in 0..64.")
+    return data
+
+
+def extract_intro_bars_from_hints(visual_tab_hints: str | dict | None) -> int | None:
+    """Validate visual_tab_hints JSON/dict and return optional intro_rest_bars override."""
+    data = _parse_visual_hints_dict(visual_tab_hints)
+    if data is None or data.get("intro_rest_bars") is None:
+        return None
+    return int(data["intro_rest_bars"])
+
+
+def parse_and_apply_visual_tab_hints(
+    notes: list[TabbedBassNote],
+    visual_tab_hints: str | dict | None,
+    bpm: float,
+    beats_per_measure: int = 4,
+    beat_type: int = 4,
+    string_count: int = 4,
+) -> tuple[list[TabbedBassNote], int | None]:
+    """Validate and apply Browser/Computer Use visual TAB overrides onto tabbed bass notes."""
+    data = _parse_visual_hints_dict(visual_tab_hints)
+    if data is None:
+        return notes, None
+
+    intro_override = int(data["intro_rest_bars"]) if data.get("intro_rest_bars") is not None else None
+    raw_measures = data.get("measures")
+    if raw_measures is None:
+        return notes, intro_override
+    if not isinstance(raw_measures, dict):
+        raise SecurityValidationError("visual_tab_hints.measures must be an object keyed by measure number.")
+
+    strings = _strings_for_count(string_count)
+    open_by_string = {s_num: open_midi for s_num, open_midi, _, _ in strings}
+
+    parsed_measures: dict[int, list[tuple[int, int, bool, bool]]] = {}
+    for m_key, entries in raw_measures.items():
+        if isinstance(m_key, bool):
+            raise SecurityValidationError("Measure number keys must be positive integers.")
+        try:
+            m_num = int(str(m_key).strip())
+        except ValueError as exc:
+            raise SecurityValidationError(f"Invalid measure number in visual_tab_hints: {m_key}") from exc
+        if not (1 <= m_num <= 2000):
+            raise SecurityValidationError("visual_tab_hints measure numbers must be in 1..2000.")
+        if not isinstance(entries, list):
+            raise SecurityValidationError(f"Measure {m_num} hints must be a list.")
+
+        parsed_entries: list[tuple[int, int, bool, bool]] = []
+        for entry in entries:
+            slide_flag = False
+            staccato_flag = False
+            if isinstance(entry, str):
+                match = _VISUAL_HINT_COORD_RE.fullmatch(entry)
+                if not match:
+                    raise SecurityValidationError(f"Invalid TAB coordinate '{entry}'; expected '<string>:<fret>'.")
+                s_num, fret = int(match.group(1)), int(match.group(2))
+            elif isinstance(entry, dict):
+                raw_s = entry.get("string", entry.get("string_num"))
+                raw_f = entry.get("fret")
+                if isinstance(raw_s, bool) or isinstance(raw_f, bool) or not isinstance(raw_s, int) or not isinstance(raw_f, int):
+                    raise SecurityValidationError("Visual TAB entry string and fret must be integers.")
+                s_num, fret = raw_s, raw_f
+                slide_flag = bool(entry.get("slide", False))
+                staccato_flag = bool(entry.get("staccato", False))
+            else:
+                raise SecurityValidationError("Visual TAB entries must be '<string>:<fret>' strings or objects.")
+
+            if not (1 <= s_num <= string_count) or not (0 <= fret <= MAX_FRET):
+                raise SecurityValidationError(
+                    f"Visual TAB coordinate ({s_num}:{fret}) out of bounds for {string_count}-string bass."
+                )
+            parsed_entries.append((s_num, fret, slide_flag, staccato_flag))
+        parsed_measures[m_num] = parsed_entries
+
+    if not notes or not parsed_measures:
+        return notes, intro_override
+
+    measure_div = _measure_divisions(beats_per_measure, beat_type)
+    div_sec = (60.0 / max(bpm, 20.0)) / DIVISIONS_PER_QUARTER
+    note_buckets: dict[int, list[int]] = {}
+    for idx, n in enumerate(notes):
+        m_idx = max(0, int(round(n.onset_sec / div_sec))) // measure_div + 1
+        note_buckets.setdefault(m_idx, []).append(idx)
+
+    updated = list(notes)
+    for m_num, hints in parsed_measures.items():
+        idxs = note_buckets.get(m_num, [])
+        for note_idx, (s_num, fret, slide_flag, staccato_flag) in zip(idxs, hints):
+            orig = updated[note_idx]
+            new_midi = open_by_string[s_num] + fret
+            updated[note_idx] = replace(
+                orig,
+                pitch_midi=new_midi,
+                note_name=midi_to_note_name(new_midi),
+                string_num=s_num,
+                fret=fret,
+                slide=slide_flag or orig.slide,
+                staccato=staccato_flag or orig.staccato,
+            )
+
+    return updated, intro_override
 
 
 def infer_key_fifths(notes: list[TabbedBassNote] | list[BassNote]) -> int:
@@ -716,6 +866,56 @@ def _decompose_divisions(duration_div: int) -> list[tuple[int, str, bool]]:
     return parts
 
 
+def _stabilize_repeated_measure_rhythms(grid_items: list[dict], measure_div: int) -> list[dict]:
+    """Normalize minority rhythm glitches when identical pitch bars repeat >=3 times."""
+    if not grid_items or measure_div <= 0:
+        return grid_items
+
+    by_measure: dict[int, list[dict]] = {}
+    for item in grid_items:
+        m_idx = item["start_div"] // measure_div
+        by_measure.setdefault(m_idx, []).append(item)
+
+    by_pitch_sig: dict[tuple[int, ...], list[tuple[int, list[dict]]]] = {}
+    for m_idx, m_items in by_measure.items():
+        if len(m_items) < 4:
+            continue
+        p_sig = tuple(it["note"].pitch_midi for it in m_items)
+        by_pitch_sig.setdefault(p_sig, []).append((m_idx, m_items))
+
+    for occurrences in by_pitch_sig.values():
+        if len(occurrences) < 3:
+            continue
+        rhythm_counts: dict[tuple[tuple[int, int], ...], int] = {}
+        for _, m_items in occurrences:
+            r_sig = tuple((it["start_div"] % measure_div, it["dur_div"]) for it in m_items)
+            rhythm_counts[r_sig] = rhythm_counts.get(r_sig, 0) + 1
+
+        canonical_rhythm, top_count = max(rhythm_counts.items(), key=lambda kv: kv[1])
+        if top_count / len(occurrences) < 0.60:
+            continue
+
+        # Ensure canonical pattern fits strictly inside one non-overlapping measure.
+        valid = True
+        prev_end = 0
+        for off, dur in canonical_rhythm:
+            if off < prev_end or dur < 1 or off + dur > measure_div:
+                valid = False
+                break
+            prev_end = off + dur
+        if not valid:
+            continue
+
+        for m_idx, m_items in occurrences:
+            cur_sig = tuple((it["start_div"] % measure_div, it["dur_div"]) for it in m_items)
+            if cur_sig != canonical_rhythm:
+                for it, (can_off, can_dur) in zip(m_items, canonical_rhythm):
+                    it["start_div"] = m_idx * measure_div + can_off
+                    it["dur_div"] = can_dur
+
+    return grid_items
+
+
 def _quantize_notes_to_grid(
     notes: list[TabbedBassNote],
     bpm: float,
@@ -753,7 +953,21 @@ def _quantize_notes_to_grid(
             prev = grid_items[-1]
             if prev["start_div"] + prev["dur_div"] > start_div:
                 prev["dur_div"] = max(1, start_div - prev["start_div"])
-        grid_items.append({"start_div": start_div, "dur_div": dur_div, "note": n})
+
+        slide_detected = bool(n.slide) or (
+            idx + 1 < len(ordered)
+            and dur_div <= 2
+            and (
+                abs(n.pitch_bend) >= 150
+                or (
+                    n.fret >= 10
+                    and (n.pitch_midi - ordered[idx + 1].pitch_midi) >= 5
+                    and (ordered[idx + 1].onset_sec - n.onset_sec) <= 4.0 * div_sec
+                )
+            )
+        )
+        note_entry = replace(n, slide=True) if slide_detected and not n.slide else n
+        grid_items.append({"start_div": start_div, "dur_div": dur_div, "note": note_entry})
 
     # Recover late-triggered 8th notes that landed on odd 16th slots leaving an empty preceding 16th rest.
     for idx, item in enumerate(grid_items):
@@ -782,6 +996,20 @@ def _quantize_notes_to_grid(
             and (item["dur_div"] + 1) % 2 == 0
         ):
             item["dur_div"] += 1
+
+    grid_items = _stabilize_repeated_measure_rhythms(grid_items, measure_div)
+
+    for idx, item in enumerate(grid_items):
+        if idx + 1 < len(grid_items):
+            gap_to_next = grid_items[idx + 1]["start_div"] - item["start_div"]
+        else:
+            gap_to_next = measure_div - (item["start_div"] % measure_div)
+        n = item["note"]
+        staccato_detected = bool(n.staccato) or (
+            item["dur_div"] == 2 and gap_to_next == 2 and n.duration_sec <= 0.72 * div_sec
+        )
+        if staccato_detected and not n.staccato:
+            item["note"] = replace(n, staccato=True)
 
     last_end = max(it["start_div"] + it["dur_div"] for it in grid_items)
     total_measures = max(1, (last_end + measure_div - 1) // measure_div)
@@ -838,16 +1066,23 @@ def _append_pitched_note(
             ET.SubElement(note_el, "dot")
         ET.SubElement(note_el, "staff").text = str(staff_num)
 
-        if include_tab or start_tie or stop_tie:
+        articulate = (note.staccato and staff_num == 1) or note.slide
+        if include_tab or start_tie or stop_tie or (articulate and is_first and not tie_stop):
             notations = ET.SubElement(note_el, "notations")
             if stop_tie:
                 ET.SubElement(notations, "tied", {"type": "stop"})
             if start_tie:
                 ET.SubElement(notations, "tied", {"type": "start"})
-            if include_tab and is_first and not tie_stop:
-                technical = ET.SubElement(notations, "technical")
-                ET.SubElement(technical, "string").text = str(note.string_num)
-                ET.SubElement(technical, "fret").text = str(note.fret)
+            if is_first and not tie_stop:
+                if note.slide:
+                    ET.SubElement(notations, "slide", {"type": "start", "line-type": "solid"})
+                if include_tab:
+                    technical = ET.SubElement(notations, "technical")
+                    ET.SubElement(technical, "string").text = str(note.string_num)
+                    ET.SubElement(technical, "fret").text = str(note.fret)
+                if note.staccato and staff_num == 1:
+                    art_el = ET.SubElement(notations, "articulations")
+                    ET.SubElement(art_el, "staccato")
 
         if lyric_text and is_first and not tie_stop and not include_tab:
             lyric_el = ET.SubElement(note_el, "lyric", {"number": "1"})
@@ -960,6 +1195,7 @@ def write_musicxml_score(
     lyric_time_shift_sec: float = 0.0,
     beat_type: int = 4,
     time_signature: str | None = None,
+    compress_repeats: bool = False,
 ) -> Path:
     """Write a valid 2-staff (Bass Clef + 4/5-string TAB + Chord symbols) MusicXML 4.0 score."""
     beats_per_measure, beat_type = resolve_time_signature(
@@ -1028,8 +1264,32 @@ def write_musicxml_score(
     for c in chords:
         chords_by_measure.setdefault(c.measure_num, []).append(c)
 
-    for m_idx in range(1, total_measures + 1):
-        measure_el = ET.SubElement(part, "measure", {"number": str(m_idx)})
+    def _measure_repeat_sig(m_num: int) -> tuple | None:
+        if m_num <= 1:
+            return None
+        ev_list = sorted(per_measure[m_num], key=lambda x: x[0])
+        if not ev_list or any(ts or tstop for _, _, _, ts, tstop in ev_list):
+            return None
+        ev_sig = tuple((off, dur, n.pitch_midi, n.string_num, n.fret) for off, dur, n, _, _ in ev_list)
+        ch_sig = tuple((c.root_step, c.root_alter, c.musicxml_kind, c.beat_offset) for c in chords_by_measure.get(m_num, ()))
+        return (ev_sig, ch_sig)
+
+    measure_specs: list[tuple[int, int]] = []
+    if compress_repeats:
+        cur_m = 1
+        while cur_m <= total_measures:
+            sig = _measure_repeat_sig(cur_m)
+            run_len = 1
+            if sig is not None:
+                while (cur_m + run_len) <= total_measures and _measure_repeat_sig(cur_m + run_len) == sig:
+                    run_len += 1
+            measure_specs.append((cur_m, run_len))
+            cur_m += run_len
+    else:
+        measure_specs = [(m, 1) for m in range(1, total_measures + 1)]
+
+    for emitted_num, (m_idx, repeat_count) in enumerate(measure_specs, start=1):
+        measure_el = ET.SubElement(part, "measure", {"number": str(emitted_num)})
         if m_idx == 1:
             attrs = ET.SubElement(measure_el, "attributes")
             ET.SubElement(attrs, "divisions").text = str(DIVISIONS_PER_QUARTER)
@@ -1062,6 +1322,14 @@ def write_musicxml_score(
             ET.SubElement(metronome, "beat-unit").text = "quarter"
             ET.SubElement(metronome, "per-minute").text = str(int(round(bpm)))
             ET.SubElement(direction, "sound", {"tempo": str(round(bpm, 1))})
+
+        if repeat_count >= 2:
+            bar_left = ET.SubElement(measure_el, "barline", {"location": "left"})
+            ET.SubElement(bar_left, "bar-style").text = "heavy-light"
+            ET.SubElement(bar_left, "repeat", {"direction": "forward"})
+            rep_dir = ET.SubElement(measure_el, "direction", {"placement": "above"})
+            rep_dt = ET.SubElement(rep_dir, "direction-type")
+            ET.SubElement(rep_dt, "words").text = f"x{repeat_count}"
 
         for chord in chords_by_measure.get(m_idx, ()):
             harmony = ET.SubElement(measure_el, "harmony", {"placement": "above"})
@@ -1114,6 +1382,11 @@ def write_musicxml_score(
                 cursor = start_off + dur_div
             if cursor < measure_div:
                 _append_rest(measure_el, measure_div - cursor, staff_num)
+
+        if repeat_count >= 2:
+            bar_right = ET.SubElement(measure_el, "barline", {"location": "right"})
+            ET.SubElement(bar_right, "bar-style").text = "light-heavy"
+            ET.SubElement(bar_right, "repeat", {"direction": "backward", "times": str(repeat_count)})
 
     ET.indent(root, space="  ")
     xml_bytes = ET.tostring(root, encoding="utf-8", xml_declaration=True)

@@ -16,7 +16,7 @@ try:
 except ImportError:  # pragma: no cover - mcp 1.x fallback
     from mcp.server.fastmcp import FastMCP
 
-from bass_mcp.downloader import acquire_audio
+from bass_mcp.downloader import acquire_audio, extract_youtube_tab_keyframes
 from bass_mcp.metadata import lookup_original_song_bpm, lookup_song_lyrics, parse_song_artist
 from bass_mcp.musescore_bridge import MuseScoreBridge
 from bass_mcp.score_builder import (
@@ -24,9 +24,11 @@ from bass_mcp.score_builder import (
     assign_bass_tab_positions,
     compute_onset_shift_sec,
     convert_with_musescore_cli,
+    extract_intro_bars_from_hints,
     find_musescore_binary,
     infer_measure_chords,
     normalize_note_onsets,
+    parse_and_apply_visual_tab_hints,
     parse_time_signature,
     render_ascii_bass_tab,
     resolve_time_signature,
@@ -46,20 +48,38 @@ from bass_mcp.separator import has_demucs, separate_bass_stem
 from bass_mcp.transcriber import (
     DEFAULT_BASS_MIN_MIDI,
     FIVE_STRING_MIN_MIDI,
+    estimate_track_start_sec,
     has_basic_pitch,
+    has_beat_this,
     has_librosa,
     midi_to_note_name,
     transcribe_bass_notes,
 )
 
+PERSONAL_USE_COPYRIGHT_NOTICE_KO = (
+    "본 서비스는 개인 연습·합주 준비를 위한 악보 초안(Draft) 작성 보조 툴입니다. "
+    "음원 추출 악보 및 화면 캡처·보정(Browser/Computer Use) 악보는 대한민국 저작권법 제30조(사적이용을 위한 복제) "
+    "범위 내의 개인 연습 용도로만 사용해야 하며, 저작권 있는 원곡 또는 제3자 편곡·TAB(제5조 2차적저작물) 악보를 "
+    "외부에 공유·배포·전송·판매하여 발생하는 모든 법적 책임은 사용자 본인에게 있습니다."
+)
+
 _SERVER_INSTRUCTIONS = (
-    "For YouTube/audio bass transcription, when the user has not explicitly specified a BPM, "
-    "call transcribe_bass_pipeline with bpm=None first. It returns song_metadata (song_title, artist), "
-    "audio_estimated_bpm, web_bpm_lookup, and a ready bass_wav stem with status='needs_bpm_confirmation'. "
+    "For YouTube/audio bass transcription, unless the user explicitly specified both BPM and score options "
+    "(or requested automatic processing), call transcribe_bass_pipeline with bpm=None first. "
+    "It returns song_metadata (song_title, artist), audio_estimated_bpm, web_bpm_lookup, "
+    "recommended_time_signature, time_signature_notice_ko, recommended_compress_repeats, copyright_notice_ko, "
+    "and a ready bass_wav stem with status='needs_bpm_confirmation'. "
     "If the track has an original song and web_bpm_lookup.bpm is null, also use your own web search "
     "(e.g. web_bpm_lookup.web_search_query) to check the original track's BPM. "
-    "Always show the user the detected '곡 명 - 가수' and BPM, ask them to confirm or enter a corrected BPM, "
-    "and then call audio_to_bass_score(audio_path=files['bass_wav'], title=<confirmed title>, bpm=<confirmed bpm>) "
+    "Always show the user the detected '곡 명 - 가수', BPM, recommended_time_signature, and "
+    "repeat-compression choice (default compress_repeats=False for full unfolded score vs True for repeat barlines), "
+    "explicitly inform them that AI automatic time-signature inference only detects 4/4, 3/4, and 6/8 "
+    "so odd/compound meters (such as 5/4, 7/8, 12/8) must be specified directly as time_signature, "
+    "and display the personal-use-only copyright notice (copyright_notice_ko). "
+    "If the AI host supports Browser Use / Computer Use / Vision and the YouTube video displays on-screen TAB, "
+    "you may offer optional visual TAB correction via prepare_youtube_tab_frames + visual_tab_hints (personal use only). "
+    "Then call audio_to_bass_score(audio_path=files['bass_wav'], title=<confirmed title>, bpm=<confirmed bpm>, "
+    "time_signature=<chosen time_signature or None>, compress_repeats=<bool>, visual_tab_hints=<json or None>) "
     "to generate the final MusicXML, MSCZ, MIDI, and TAB without re-running stem separation."
 )
 
@@ -103,19 +123,44 @@ def _build_score_artifacts(
     string_count: int,
     lyrics: list[Any] | None = None,
     time_signature: str | None = None,
+    compress_repeats: bool = False,
+    visual_tab_hints: str | None = None,
+    source_wav_path: Path | None = None,
 ) -> dict[str, Any]:
     beats, beat_type = resolve_time_signature(
         notes,
         bpm=bpm,
         time_signature=time_signature if time_signature is not None else "auto",
     )
+    intro_override = extract_intro_bars_from_hints(visual_tab_hints)
+    track_start_sec = estimate_track_start_sec(source_wav_path)
     shift_sec = compute_onset_shift_sec(
-        notes, bpm=bpm, beats_per_measure=beats, preserve_intro_bars=True, beat_type=beat_type
+        notes,
+        bpm=bpm,
+        beats_per_measure=beats,
+        preserve_intro_bars=True,
+        beat_type=beat_type,
+        track_start_sec=track_start_sec,
+        intro_rest_bars_override=intro_override,
     )
     aligned_notes = normalize_note_onsets(
-        notes, bpm=bpm, beats_per_measure=beats, preserve_intro_bars=True, beat_type=beat_type
+        notes,
+        bpm=bpm,
+        beats_per_measure=beats,
+        preserve_intro_bars=True,
+        beat_type=beat_type,
+        track_start_sec=track_start_sec,
+        intro_rest_bars_override=intro_override,
     )
     tabbed = assign_bass_tab_positions(aligned_notes, string_count=string_count)
+    tabbed, _ = parse_and_apply_visual_tab_hints(
+        tabbed,
+        visual_tab_hints,
+        bpm=bpm,
+        beats_per_measure=beats,
+        beat_type=beat_type,
+        string_count=string_count,
+    )
     chords = infer_measure_chords(tabbed, bpm=bpm, beats_per_measure=beats, beat_type=beat_type)
 
     midi_path = write_midi_file(tabbed, job_dir / "bass_line.mid", bpm=bpm)
@@ -130,6 +175,7 @@ def _build_score_artifacts(
         lyrics=lyrics,
         lyric_time_shift_sec=shift_sec,
         beat_type=beat_type,
+        compress_repeats=compress_repeats,
     )
     ascii_tab = render_ascii_bass_tab(
         tabbed, chords, bpm=bpm, string_count=string_count, beats_per_measure=beats, beat_type=beat_type
@@ -140,6 +186,7 @@ def _build_score_artifacts(
         "tabbed_notes": tabbed,
         "chords": [{"measure": c.measure_num, "symbol": c.symbol} for c in chords],
         "time_signature": f"{beats}/{beat_type}",
+        "compress_repeats": bool(compress_repeats),
         "midi_path": midi_path,
         "musicxml_path": musicxml_path,
         "mscz_path": mscz_path,
@@ -244,15 +291,20 @@ async def transcribe_bass_pipeline(
     send_to_musescore: bool = False,
     auto_confirm_bpm: bool = False,
     time_signature: str | None = None,
+    compress_repeats: bool = False,
+    visual_tab_hints: str | None = None,
 ) -> dict[str, Any]:
     """Convert a YouTube URL or local audio file into Bass MusicXML, 4/5-string TAB, chords, and MIDI.
 
     When bpm is omitted and auto_confirm_bpm is False, extracts song metadata, isolates the bass stem,
     checks public BPM lookup, and returns status='needs_bpm_confirmation' so the user can confirm or
-    correct 'song_title - artist', BPM, and time_signature ('4/4', '3/4', '6/8', or 'auto') before
-    generating final score files with audio_to_bass_score.
+    correct 'song_title - artist', BPM, time_signature, compress_repeats, and optional visual_tab_hints.
+    Note: automatic time_signature inference only classifies 4/4, 3/4, and 6/8; odd/compound meters
+    (e.g. 5/4, 7/8, 12/8) must be specified explicitly via time_signature before finalizing with
+    audio_to_bass_score. Intended strictly for personal practice draft scores under Copyright Act Art. 30.
     """
     parse_time_signature(time_signature)
+    extract_intro_bars_from_hints(visual_tab_hints)
     min_midi = _min_midi_for_strings(string_count)
     job_dir = prepare_job_output_dir(_get_output_root())
 
@@ -306,6 +358,17 @@ async def transcribe_bass_pipeline(
             "web_bpm_lookup": web_lookup,
             "recommended_bpm": suggested_bpm,
             "recommended_time_signature": rec_time_sig,
+            "auto_time_signature_candidates": ["4/4", "3/4", "6/8"],
+            "time_signature_notice_ko": (
+                "AI 자동 박자표 판별은 4/4·3/4·6/8 3종만 추론하므로 "
+                "5/4·7/8·12/8 등 변칙/복합박자는 time_signature를 직접 지정해야 합니다."
+            ),
+            "recommended_compress_repeats": bool(compress_repeats),
+            "compress_repeats_notice_ko": (
+                "반복 마디 표기 방식: 기본값은 풀 스코어(전체 마디 전개, compress_repeats=False)이며, "
+                "도돌이표 압축 악보를 원하시면 compress_repeats=True를 선택하세요."
+            ),
+            "copyright_notice_ko": PERSONAL_USE_COPYRIGHT_NOTICE_KO,
             "engines": {
                 "separator": sep["engine"],
                 "transcriber": trans["engine"],
@@ -319,15 +382,26 @@ async def transcribe_bass_pipeline(
                 f"감지된 곡 명-가수: {display_name}\n"
                 f"추정 BPM: {suggested_bpm} BPM (오디오 자동 추정: {trans['estimated_bpm']} BPM)\n"
                 f"추천 박자표: {rec_time_sig} (선택하지 않으면 AI 자동 추정 적용)\n"
-                "원본 곡 명-가수, BPM, 박자표가 맞는지 확인해 주세요. 수정할 항목이 있다면 입력해 주세요."
+                "※ AI 자동 박자표 판별은 4/4·3/4·6/8 3종만 추론하므로 "
+                "5/4·7/8·12/8 등 변칙/복합박자는 time_signature를 직접 지정해야 합니다.\n"
+                f"※ 반복 마디 설정: {'도돌이표 압축(compress_repeats=True)' if compress_repeats else '풀 스코어 전개(기본값)'} 중 원하시는 방식을 선택해 주세요.\n"
+                "※ Browser/Computer Use 화면 보정: 유튜브 영상에 TAB 화면이 포함된 경우 개인 연습용에 한해 "
+                "화면 캡처 보정(prepare_youtube_tab_frames + visual_tab_hints) 적용 여부를 알려주세요.\n"
+                f"※ 저작권 안내: {PERSONAL_USE_COPYRIGHT_NOTICE_KO}\n"
+                "원본 곡 명-가수, BPM, 박자표, 도돌이표 압축 여부를 확인·입력해 주세요."
             ),
             "next_step_instructions": (
                 "If this track has an original release and web_bpm_lookup.bpm is null, run a web search "
                 "using web_bpm_lookup.web_search_query to check the original BPM. Then present the song "
-                "name - artist, BPM, and recommended_time_signature to the user, ask for confirmation or "
-                "a corrected BPM / time_signature, and call audio_to_bass_score(audio_path=files['bass_wav'], "
-                "title=<confirmed_title>, bpm=<confirmed_bpm>, string_count=..., time_signature=<chosen or None>) "
-                "to finalize the score."
+                "name - artist, BPM, recommended_time_signature, time_signature_notice_ko, "
+                "compress_repeats_notice_ko (full score vs repeat-bar compression), optional Browser/Computer Use "
+                "visual TAB correction availability, and copyright_notice_ko to the user. If the user asks for "
+                "visual TAB correction on a YouTube video and Browser/Computer Use is available, call "
+                "prepare_youtube_tab_frames(source=source_ref) or inspect frames via Browser/Computer Use to build "
+                "visual_tab_hints JSON (for personal practice only). Finally call "
+                "audio_to_bass_score(audio_path=files['bass_wav'], title=<confirmed_title>, bpm=<confirmed_bpm>, "
+                "string_count=..., time_signature=<chosen or None>, compress_repeats=<bool>, "
+                "visual_tab_hints=<json or None>) to finalize the score."
             ),
         }
 
@@ -349,6 +423,9 @@ async def transcribe_bass_pipeline(
         string_count=string_count,
         lyrics=lyric_lines,
         time_signature=time_signature,
+        compress_repeats=compress_repeats,
+        visual_tab_hints=visual_tab_hints,
+        source_wav_path=acq["wav_path"],
     )
 
     push_result: dict[str, Any] | None = None
@@ -367,6 +444,7 @@ async def transcribe_bass_pipeline(
         "duration_sec": acq["duration_sec"],
         "bpm": effective_bpm,
         "time_signature": scored["time_signature"],
+        "compress_repeats": scored["compress_repeats"],
         "string_count": string_count,
         "engines": {
             "separator": sep["engine"],
@@ -395,6 +473,7 @@ async def transcribe_bass_pipeline(
             for n in tabbed[:32]
         ],
         "musescore_push": push_result,
+        "copyright_notice_ko": PERSONAL_USE_COPYRIGHT_NOTICE_KO,
     }
 
 
@@ -427,9 +506,17 @@ def audio_to_bass_score(
     bpm: float | None = None,
     string_count: int = 4,
     time_signature: str | None = None,
+    compress_repeats: bool = False,
+    visual_tab_hints: str | None = None,
 ) -> dict[str, Any]:
-    """Convert an already-isolated local bass audio file into MusicXML, TAB, chords, and MIDI."""
+    """Convert an already-isolated local bass audio file into MusicXML, TAB, chords, and MIDI.
+
+    time_signature accepts 'auto'/None (infers 4/4, 3/4, or 6/8) or an explicit meter such as '5/4', '7/8', or '12/8'.
+    compress_repeats collapses repeated identical measures with repeat barlines when True (False = full score).
+    visual_tab_hints accepts optional JSON from Browser/Computer Use TAB inspection for personal practice only.
+    """
     parse_time_signature(time_signature)
+    extract_intro_bars_from_hints(visual_tab_hints)
     if is_uri_input(audio_path):
         raise SecurityValidationError("audio_to_bass_score accepts local file paths only, not URLs.")
     allowed_dirs = _effective_allowed_dirs()
@@ -454,6 +541,9 @@ def audio_to_bass_score(
     )
     job_dir = _rebase_job_dir(job_dir, canon_song, canon_artist, (acq, "wav_path"))
 
+    sibling_source = resolved_audio.parent / "source_audio.wav"
+    source_wav = sibling_source if sibling_source.is_file() and not sibling_source.is_symlink() else acq["wav_path"]
+
     trans = transcribe_bass_notes(acq["wav_path"], min_midi=min_midi, bpm_hint=bpm)
     effective_bpm = float(bpm) if bpm and bpm > 0 else float(trans["estimated_bpm"])
     scored = _build_score_artifacts(
@@ -464,6 +554,9 @@ def audio_to_bass_score(
         string_count=string_count,
         lyrics=lyric_lines,
         time_signature=time_signature,
+        compress_repeats=compress_repeats,
+        visual_tab_hints=visual_tab_hints,
+        source_wav_path=source_wav,
     )
     tabbed: list[TabbedBassNote] = scored["tabbed_notes"]
 
@@ -474,6 +567,7 @@ def audio_to_bass_score(
         "duration_sec": acq["duration_sec"],
         "bpm": effective_bpm,
         "time_signature": scored["time_signature"],
+        "compress_repeats": scored["compress_repeats"],
         "string_count": string_count,
         "engine": trans["engine"],
         "files": {
@@ -485,6 +579,7 @@ def audio_to_bass_score(
         "lyrics_count": len(lyric_lines),
         "chords": scored["chords"],
         "ascii_tab": scored["ascii_tab"],
+        "copyright_notice_ko": PERSONAL_USE_COPYRIGHT_NOTICE_KO,
     }
 
 
@@ -605,6 +700,44 @@ async def musescore_live_push(musicxml_or_notes_json: str, port: int = 8765) -> 
 
 
 @mcp.tool()
+def prepare_youtube_tab_frames(
+    source: str,
+    interval_sec: float = 4.0,
+    max_frames: int = 12,
+) -> dict[str, Any]:
+    """Capture bounded YouTube TAB keyframes or return a Browser/Computer Use guide for personal correction only."""
+    job_dir = prepare_job_output_dir(_get_output_root())
+    res = extract_youtube_tab_keyframes(
+        source=source,
+        job_dir=job_dir,
+        interval_sec=interval_sec,
+        max_frames=max_frames,
+    )
+    return {
+        "status": "ok",
+        "job_dir": str(job_dir),
+        "canonical_url": res["canonical_url"],
+        "frames_dir": res["frames_dir"],
+        "frames": res["frames"],
+        "note": res["note"],
+        "visual_tab_hints_schema": {
+            "intro_rest_bars": 8,
+            "measures": {
+                "10": ["4:6", {"string": 4, "fret": 6, "slide": True, "staccato": False}],
+                "11": ["4:1"],
+            },
+        },
+        "browser_computer_use_guide": (
+            "If Browser Use / Computer Use is available on your AI host, inspect canonical_url or the saved JPG frames "
+            "to read on-screen intro_rest_bars and per-measure <string>:<fret> coordinates (plus slide/staccato flags), "
+            "then pass them as visual_tab_hints JSON into transcribe_bass_pipeline or audio_to_bass_score. "
+            "Strictly for personal practice use (저작권법 제30조); never redistribute captured TABs."
+        ),
+        "copyright_notice_ko": PERSONAL_USE_COPYRIGHT_NOTICE_KO,
+    }
+
+
+@mcp.tool()
 def check_environment_status() -> dict[str, Any]:
     """Report available external tools, ML engines, MuseScore CLI, and open-source attributions."""
     return {
@@ -616,12 +749,14 @@ def check_environment_status() -> dict[str, Any]:
             "demucs": has_demucs(),
             "basic_pitch": has_basic_pitch(),
             "librosa": has_librosa(),
+            "beat_this": has_beat_this(),
             "pretty_midi": importlib.util.find_spec("pretty_midi") is not None,
             "musescore_cli": find_musescore_binary(),
         },
         "attributions": [
             {"project": "spotify/basic-pitch", "license": "Apache-2.0"},
-            {"project": "facebookresearch/demucs", "license": "MIT"},
+            {"project": "facebookresearch/demucs", "license": "MIT (code); non-commercial/research (pretrained weights)"},
+            {"project": "CPJKU/beat_this", "license": "MIT"},
             {"project": "ghchen99/mcp-musescore", "license": "MIT"},
             {"project": "sandraschi/stems-mcp", "license": "MIT"},
             {"project": "craffel/pretty-midi", "license": "MIT"},

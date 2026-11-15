@@ -10,9 +10,12 @@ import pytest
 from bass_mcp.score_builder import (
     _quantize_notes_to_grid,
     assign_bass_tab_positions,
+    compute_onset_shift_sec,
+    extract_intro_bars_from_hints,
     infer_measure_chords,
     infer_time_signature,
     normalize_note_onsets,
+    parse_and_apply_visual_tab_hints,
     render_ascii_bass_tab,
     write_midi_file,
     write_musicxml_score,
@@ -317,3 +320,97 @@ def test_time_signature_selection_and_auto_inference(tmp_path: Path) -> None:
         for b in range(4)
     ]
     assert infer_time_signature(rock_notes, bpm=bpm) == (4, 4)
+
+
+def test_compress_repeats_collapses_identical_measures_with_repeat_barlines(tmp_path: Path) -> None:
+    bpm = 120.0
+    beat = 60.0 / bpm
+    raw = [
+        BassNote(28, "E1", 0.0, 1.9, 90),  # Measure 1
+        *[
+            BassNote(36, "C2", (bar * 4 + b) * beat, 0.45, 85)
+            for bar in (1, 2, 3)
+            for b in range(4)
+        ],
+    ]
+    tabbed = assign_bass_tab_positions(raw, string_count=4)
+    chords = infer_measure_chords(tabbed, bpm=bpm)
+    xml_path = tmp_path / "compressed.musicxml"
+    write_musicxml_score(tabbed, chords, xml_path, bpm=bpm, compress_repeats=True)
+    root = ET.parse(xml_path).getroot()
+    measures = root.findall("./part/measure")
+    assert len(measures) == 2
+    assert [m.get("number") for m in measures] == ["1", "2"]
+    m2 = measures[1]
+    assert m2.find("./barline[@location='left']/repeat[@direction='forward']") is not None
+    back = m2.find("./barline[@location='right']/repeat[@direction='backward']")
+    assert back is not None and back.get("times") == "3"
+    assert m2.findtext("./direction/direction-type/words") == "x3"
+
+
+def test_stabilize_repeated_measure_rhythms_and_articulations(tmp_path: Path) -> None:
+    bpm = 120.0
+    # 3 bars of steady 4 quarter notes (A1) + 1 identical-pitch bar with skewed 16th/odd beat jitter.
+    notes_list: list[BassNote] = []
+    for bar in range(3):
+        base = bar * 2.0
+        for b in range(4):
+            notes_list.append(BassNote(33, "A1", base + b * 0.5, 0.46, 85))
+    # Bar 4 has pitch sequence (33,33,33,33) with a skewed beat 2 at 6.375 (div 3) and dur 0.30 (dur 2).
+    notes_list.extend(
+        [
+            BassNote(33, "A1", 6.0, 0.25, 85),
+            BassNote(33, "A1", 6.375, 0.48, 85),
+            BassNote(33, "A1", 7.0, 0.46, 85),
+            BassNote(33, "A1", 7.5, 0.46, 85),
+        ]
+    )
+    # Bar 5: short staccato 8th plucks + high fret glissando pickup into final note.
+    notes_list.extend(
+        [
+            BassNote(33, "A1", 8.0, 0.08, 85),
+            BassNote(33, "A1", 8.25, 0.22, 85),
+            BassNote(57, "A3", 8.5, 0.12, 88),  # 1:14 slide -> 4:5 (A1)
+            BassNote(33, "A1", 8.75, 0.45, 85),
+        ]
+    )
+    tabbed = assign_bass_tab_positions(notes_list, string_count=4)
+    _, grid = _quantize_notes_to_grid(tabbed, bpm=bpm, beats_per_measure=4)
+    bar4 = [it for it in grid if 48 <= it["start_div"] < 64]
+    assert [(it["start_div"], it["dur_div"]) for it in bar4] == [(48, 4), (52, 4), (56, 4), (60, 4)]
+
+    chords = infer_measure_chords(tabbed, bpm=bpm)
+    xml_path = tmp_path / "articulated.musicxml"
+    write_musicxml_score(tabbed, chords, xml_path, bpm=bpm)
+    root = ET.parse(xml_path).getroot()
+    assert root.find(".//articulations/staccato") is not None
+    assert root.find(".//notations/slide[@type='start']") is not None
+
+
+def test_apply_visual_tab_hints_overrides_fret_and_intro_bars_and_rejects_bad_input() -> None:
+    hints = (
+        '{"intro_rest_bars": 8, '
+        '"measures": {"1": ["3:5", {"string": 3, "fret": 5, "slide": true, "staccato": true}]}}'
+    )
+    assert extract_intro_bars_from_hints(hints) == 8
+
+    raw = [BassNote(33, "A1", 0.0, 0.4, 85), BassNote(33, "A1", 0.5, 0.4, 85)]
+    tabbed = assign_bass_tab_positions(raw, string_count=4)
+    updated, intro_override = parse_and_apply_visual_tab_hints(tabbed, hints, bpm=120.0)
+    assert intro_override == 8
+    assert [(n.string_num, n.fret, n.pitch_midi) for n in updated] == [(3, 5, 38), (3, 5, 38)]
+    assert updated[1].slide is True and updated[1].staccato is True
+
+    shift = compute_onset_shift_sec(
+        [BassNote(33, "A1", 10.0, 0.4, 85)], bpm=120.0, intro_rest_bars_override=8
+    )
+    assert abs(shift - (10.0 - 16.0)) < 1e-4
+
+    for bad_payload in (
+        "{not json",
+        '{"intro_rest_bars": -1}',
+        '{"measures": {"1": ["9:1"]}}',
+        '{"measures": {"1": ["4:99"]}}',
+    ):
+        with pytest.raises(SecurityValidationError):
+            parse_and_apply_visual_tab_hints(tabbed, bad_payload, bpm=120.0)

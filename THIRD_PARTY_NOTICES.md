@@ -191,8 +191,8 @@
 ## 2. Meta / Facebook Research Demucs (`facebookresearch/demucs`)
 - **Repository:** https://github.com/facebookresearch/demucs
 - **Copyright:** Copyright (c) Meta Platforms, Inc. and affiliates. All rights reserved.
-- **License:** MIT License
-- **Dataset Note:** Pre-trained Demucs models (such as `htdemucs`) were trained on datasets including MUSDB18-HQ; verify upstream model/dataset terms before commercial distribution of model outputs/weights.
+- **License:** MIT License (Source Code & Inference Architecture)
+- **Pretrained Weights Notice:** Meta's pretrained checkpoints (such as `htdemucs` and `mdx`) are **not** distributed with this repository and are **not** covered by the MIT License. Because `htdemucs` was trained on datasets including **MUSDB18 / MUSDB18-HQ** (bound by research-only terms), upstream maintainers classify the pretrained weights for **personal, non-commercial, and scientific/research use only**. Do not bundle or commercially redistribute Demucs checkpoints without independent legal review.
 
 ```text
 MIT License
@@ -315,6 +315,13 @@ SOFTWARE.
 
 ---
 
-## 10. External Optional Runtime Binaries (FFmpeg, MuseScore CLI)
+## 10. `CPJKU/beat_this` (Optional `[beat]` Extra)
+- **Repository:** https://github.com/CPJKU/beat_this
+- **License:** MIT License (code and published model weights)
+- **Caveat:** Upstream notes that underlying training audio datasets remain subject to their respective copyright/Creative Commons terms.
+
+---
+
+## 11. External Optional Runtime Binaries (FFmpeg, MuseScore CLI)
 - **FFmpeg** (https://ffmpeg.org/) and **MuseScore 4/3** (https://musescore.org/, GPL-3.0) are **not** bundled, statically linked, or imported in this repository.
 - When installed on the user's system, they are invoked strictly as external command-line subprocesses over standard audio/MusicXML files.

@@ -23,6 +23,8 @@ output/
 *.musicxml
 *.mscz
 *.pdf
+*.jpg
+tab_frames/
 
 # IDE & OS
 .vscode/

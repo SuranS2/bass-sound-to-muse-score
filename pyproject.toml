@@ -25,6 +25,9 @@ ml = [
     "librosa>=0.10.0",
     "pretty_midi>=0.2.10",
 ]
+beat = [
+    "beat_this @ git+https://github.com/CPJKU/beat_this.git",
+]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
