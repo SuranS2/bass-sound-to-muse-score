@@ -303,6 +303,18 @@ SOFTWARE.
 
 ---
 
-## 8. FFmpeg (External Runtime Binary)
-- **Website:** https://ffmpeg.org/
-- Invoked externally as an optional system binary if installed on `PATH`; not bundled in this repository. Check your local FFmpeg build's LGPL/GPL license configuration.
+## 8. `librosa` (`librosa/librosa`)
+- **Repository:** https://github.com/librosa/librosa
+- **License:** ISC License
+
+---
+
+## 9. `NumPy`, `SciPy`, and `websockets`
+- **Repositories:** https://github.com/numpy/numpy, https://github.com/scipy/scipy, https://github.com/python-websockets/websockets
+- **License:** BSD 3-Clause License
+
+---
+
+## 10. External Optional Runtime Binaries (FFmpeg, MuseScore CLI)
+- **FFmpeg** (https://ffmpeg.org/) and **MuseScore 4/3** (https://musescore.org/, GPL-3.0) are **not** bundled, statically linked, or imported in this repository.
+- When installed on the user's system, they are invoked strictly as external command-line subprocesses over standard audio/MusicXML files.

@@ -98,7 +98,7 @@ def _build_score_artifacts(
     bpm: float,
     string_count: int,
 ) -> dict[str, Any]:
-    aligned_notes = normalize_note_onsets(notes)
+    aligned_notes = normalize_note_onsets(notes, bpm=bpm, preserve_intro_bars=True)
     tabbed = assign_bass_tab_positions(aligned_notes, string_count=string_count)
     chords = infer_measure_chords(tabbed, bpm=bpm)
 

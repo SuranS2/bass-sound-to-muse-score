@@ -140,3 +140,44 @@ def test_quantize_notes_prevents_16th_rest_fragmentation(tmp_path: Path) -> None
     staff1_notes = [n for n in root.findall(".//measure[@number='1']/note") if n.findtext("staff") == "1"]
     assert all(n.find("rest") is None for n in staff1_notes)
     assert [n.findtext("type") for n in staff1_notes] == ["eighth"] * 8
+
+
+def test_normalize_note_onsets_preserves_intro_bars_for_ensemble(tmp_path: Path) -> None:
+    raw_notes = [BassNote(32, "G#1", 9.056 + i * 0.2655, 0.18) for i in range(4)]
+    aligned = normalize_note_onsets(raw_notes, bpm=113.0, preserve_intro_bars=True)
+    measure_sec = 4 * 60.0 / 113.0
+    assert abs(aligned[0].onset_sec - 4.0 * measure_sec) < 0.01
+
+    tabbed = assign_bass_tab_positions(aligned, string_count=4)
+    chords = infer_measure_chords(tabbed, bpm=113.0)
+    xml_path = tmp_path / "with_intro.musicxml"
+    write_musicxml_score(tabbed, chords, xml_path, bpm=113.0)
+    root = ET.parse(xml_path).getroot()
+    for m_num in ("1", "2", "3", "4"):
+        m_notes = root.findall(f".//measure[@number='{m_num}']/note")
+        assert all(n.find("rest") is not None for n in m_notes)
+    m5_notes = [n for n in root.findall(".//measure[@number='5']/note") if n.findtext("staff") == "2"]
+    assert any(n.find("rest") is None for n in m5_notes)
+
+
+def test_infer_key_fifths_and_half_measure_chords_use_flats(tmp_path: Path) -> None:
+    beat = 60.0 / 113.0
+    notes = [
+        BassNote(32, "G#1", 0.0 * beat, 0.4, 85),
+        BassNote(32, "G#1", 0.5 * beat, 0.4, 85),
+        BassNote(31, "G1", 2.0 * beat, 0.4, 85),
+        BassNote(43, "G2", 3.0 * beat, 0.4, 85),
+        BassNote(36, "C2", 4.0 * beat, 0.8, 85),
+        BassNote(39, "D#2", 6.0 * beat, 0.8, 85),
+    ]
+    tabbed = assign_bass_tab_positions(notes, string_count=4)
+    chords = infer_measure_chords(tabbed, bpm=113.0)
+    assert [c.symbol for c in chords] == ["Ab", "Gm", "Cm", "Eb"]
+    assert [c.beat_offset for c in chords] == [0, 2, 0, 2]
+
+    xml_path = tmp_path / "flat_chords.musicxml"
+    write_musicxml_score(tabbed, chords, xml_path, bpm=113.0)
+    root = ET.parse(xml_path).getroot()
+    assert int(root.findtext(".//attributes/key/fifths")) < 0
+    m1_offsets = [h.findtext("offset") for h in root.findall(".//measure[@number='1']/harmony")]
+    assert m1_offsets == [None, "8"]

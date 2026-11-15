@@ -35,3 +35,19 @@ See THIRD_PARTY_NOTICES.md for complete license texts and attributions.
 
 7. yt-dlp (https://github.com/yt-dlp/yt-dlp)
    Released into the public domain under The Unlicense.
+
+8. librosa (https://github.com/librosa/librosa)
+   Copyright (c) librosa development team
+   Licensed under the ISC License.
+
+9. NumPy (https://github.com/numpy/numpy) & SciPy (https://github.com/scipy/scipy)
+   Licensed under the BSD 3-Clause License.
+
+10. websockets (https://github.com/python-websockets/websockets)
+   Copyright (c) Aymeric Augustin and contributors
+   Licensed under the BSD 3-Clause License.
+
+11. External optional binaries (not bundled or linked):
+   - FFmpeg (https://ffmpeg.org/) — invoked via external subprocess if on PATH.
+   - MuseScore 4 / 3 CLI (https://musescore.org/) — GPL-3.0; invoked strictly
+     via external subprocess to convert standard MusicXML files to .mscz/.pdf.

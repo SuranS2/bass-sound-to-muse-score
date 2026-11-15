@@ -337,7 +337,7 @@ def _transcribe_librosa_pyin(
     onset_frames = {
         int(x)
         for x in librosa.onset.onset_detect(
-            y=audio, sr=sr, hop_length=hop, backtrack=False, delta=0.05
+            y=audio, sr=sr, hop_length=hop, backtrack=False, delta=0.03
         )
     }
     n = min(len(f0), len(rms))
@@ -355,7 +355,7 @@ def _transcribe_librosa_pyin(
         min_note_len_sec=min_note_len_sec,
         onset_frames=onset_frames,
     )
-    return _clean_transcribed_notes(notes, min_velocity=50)
+    return _clean_transcribed_notes(notes, min_velocity=62)
 
 
 def _clean_transcribed_notes(notes: list[BassNote], min_velocity: int = 66) -> list[BassNote]:
@@ -380,7 +380,7 @@ def _clean_transcribed_notes(notes: list[BassNote], min_velocity: int = 66) -> l
             if (
                 cur.pitch_midi == prev.pitch_midi
                 and gap <= 0.045
-                and (cur.onset_sec - prev.onset_sec) < 0.14
+                and (cur.onset_sec - prev.onset_sec) < 0.09
             ):
                 new_end = max(prev.onset_sec + prev.duration_sec, cur.onset_sec + cur.duration_sec)
                 merged[-1] = BassNote(
