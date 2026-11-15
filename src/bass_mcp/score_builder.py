@@ -224,7 +224,7 @@ def infer_measure_chords(
         pc_weights: dict[int, float] = {}
         for n in m_notes:
             beat_in_bar = (n.onset_sec - (m_idx - 1) * measure_sec) / sec_per_beat
-            strong_bonus = 2.0 if beat_in_bar < 0.75 else (1.3 if abs(beat_in_bar - 2.0) < 0.75 else 1.0)
+            strong_bonus = 3.5 if beat_in_bar < 0.5 else (1.3 if abs(beat_in_bar - 2.0) < 0.5 else 1.0)
             pc = n.pitch_midi % 12
             pc_weights[pc] = pc_weights.get(pc, 0.0) + max(0.1, n.duration_sec) * strong_bonus
 

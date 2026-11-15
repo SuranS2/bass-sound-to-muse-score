@@ -11,7 +11,10 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+try:
+    from mcp.server.mcpserver import MCPServer as FastMCP
+except ImportError:  # pragma: no cover - mcp 1.x fallback
+    from mcp.server.fastmcp import FastMCP
 
 from bass_mcp.downloader import acquire_audio
 from bass_mcp.musescore_bridge import MuseScoreBridge
@@ -54,6 +57,12 @@ def _get_output_root() -> Path:
     if configured:
         return Path(configured)
     return Path.cwd() / "output"
+
+
+def _effective_allowed_dirs() -> list[Path] | None:
+    """When BASS_MCP_ALLOWED_DIRS is set, also permit files generated inside output_root."""
+    env_dirs = parse_allowed_dirs(None)
+    return [_get_output_root(), *env_dirs] if env_dirs else None
 
 
 def _sanitize_title(title: str) -> str:
@@ -200,13 +209,14 @@ def audio_to_bass_score(
     """Convert an already-isolated local bass audio file into MusicXML, TAB, chords, and MIDI."""
     if is_uri_input(audio_path):
         raise SecurityValidationError("audio_to_bass_score accepts local file paths only, not URLs.")
-    validate_input_audio_path(audio_path)
+    allowed_dirs = _effective_allowed_dirs()
+    validate_input_audio_path(audio_path, allowed_dirs=allowed_dirs)
 
     safe_title = _sanitize_title(title)
     min_midi = _min_midi_for_strings(string_count)
     job_dir = prepare_job_output_dir(_get_output_root())
 
-    acq = acquire_audio(source=audio_path, job_dir=job_dir)
+    acq = acquire_audio(source=audio_path, job_dir=job_dir, allowed_dirs=allowed_dirs)
     trans = transcribe_bass_notes(acq["wav_path"], min_midi=min_midi, bpm_hint=bpm)
     effective_bpm = float(bpm) if bpm and bpm > 0 else float(trans["estimated_bpm"])
     scored = _build_score_artifacts(
@@ -278,13 +288,11 @@ def _parse_notes_from_json(payload_text: str) -> tuple[str, list[TabbedBassNote]
 
 
 def _parse_notes_from_musicxml(path_str: str) -> tuple[str, list[TabbedBassNote]]:
-    env_dirs = parse_allowed_dirs(None)
-    allowed_dirs = [_get_output_root(), *env_dirs] if env_dirs else None
     resolved = validate_input_file_path(
         file_path=path_str,
         allowed_extensions=frozenset({".musicxml", ".xml"}),
         max_bytes=_MAX_PUSH_PAYLOAD_BYTES,
-        allowed_dirs=allowed_dirs,
+        allowed_dirs=_effective_allowed_dirs(),
         label="MusicXML",
     )
 
