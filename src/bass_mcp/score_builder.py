@@ -102,6 +102,89 @@ def _fit_pitch_to_bass_range(pitch_midi: int, min_midi: int, max_midi: int) -> i
     return max(min_midi, min(max_midi, p))
 
 
+def normalize_note_onsets(notes: list[BassNote], min_trim_sec: float = 0.25) -> list[BassNote]:
+    """Shift leading silence so the first bass entrance aligns near t=0 (Measure 1, Beat 1)."""
+    if not notes:
+        return []
+    ordered = sorted(notes, key=lambda n: n.onset_sec)
+    t0 = ordered[0].onset_sec
+    if t0 <= min_trim_sec:
+        return ordered
+    return [
+        BassNote(
+            pitch_midi=n.pitch_midi,
+            note_name=n.note_name,
+            onset_sec=round(max(0.0, n.onset_sec - t0), 4),
+            duration_sec=n.duration_sec,
+            velocity=n.velocity,
+            pitch_bend=n.pitch_bend,
+        )
+        for n in ordered
+    ]
+
+
+def _position_cost(s_num: int, fret: int, pitch_midi: int, has_open_e_context: bool) -> float:
+    """Static fretboard cost favoring middle-neck 3rd/4th-string box positions over thin low frets."""
+    if fret > 12:
+        return 3.0 + (fret - 12) * 0.9
+
+    if fret == 0:
+        if pitch_midi == 28:  # E1 is only playable open on 4-string bass
+            return 0.0
+        if s_num in (1, 2):
+            return 4.2
+        if s_num == 3:
+            return 0.0 if has_open_e_context else 2.8
+        return 0.2
+
+    if s_num in (1, 2) and fret in (1, 2):
+        return 3.2 + (0.16 * fret)
+    if s_num == 3 and fret == 1:
+        return 1.8 + (0.12 * fret)
+    if s_num == 3 and fret == 2:
+        return (0.3 if has_open_e_context else 1.2) + (0.12 * fret)
+
+    string_weight = 0.25 if s_num == 1 else (0.16 if s_num == 2 else 0.12)
+    return fret * string_weight
+
+
+def _transition_cost(
+    s_prev: int,
+    f_prev: int,
+    m_prev: int,
+    s_cur: int,
+    f_cur: int,
+    m_cur: int,
+    has_open_e_context: bool,
+) -> float:
+    """Fretboard transition cost enforcing same-fret repeats, 2-string octave shapes, and box continuity."""
+    if m_cur == m_prev:
+        return 0.0 if (s_cur == s_prev and f_cur == f_prev) else 6.0
+
+    # Standard bass octave shape: +2 frets, 2 strings higher in pitch (lower string_num).
+    if abs(m_cur - m_prev) == 12:
+        is_up_octave = (m_cur - m_prev == 12) and (s_prev - s_cur == 2) and (f_cur - f_prev == 2)
+        is_down_octave = (m_prev - m_cur == 12) and (s_cur - s_prev == 2) and (f_prev - f_cur == 2)
+        if is_up_octave or is_down_octave:
+            return 0.0
+
+    df = abs(f_cur - f_prev)
+    ds = abs(s_cur - s_prev)
+
+    if has_open_e_context and (f_cur == 0 or f_prev == 0) and max(f_cur, f_prev) <= 4:
+        cost = min(df, 1) * 0.35 + ds * 0.25
+    elif df <= 3:
+        cost = (df * 0.45) + (ds * 0.35)
+        if s_cur == s_prev and s_cur in (3, 4):
+            cost = max(0.0, cost - 0.35)
+    else:
+        cost = 1.35 + ((df - 3) * 1.35) + (ds * 0.45)
+
+    if abs(m_cur - m_prev) == 12:
+        cost += 3.5
+    return cost
+
+
 def assign_bass_tab_positions(
     notes: list[BassNote],
     string_count: int = 4,
@@ -126,14 +209,19 @@ def assign_bass_tab_positions(
             opts = [(strings[-1][0], 0, strings[-1][1])]
         candidates_per_note.append(opts)
 
-    # Dynamic programming over fretboard positions.
     n = len(candidates_per_note)
+    open_e_mask = [
+        any(notes[j].pitch_midi == 28 for j in range(max(0, idx - 3), min(n, idx + 4)))
+        for idx in range(n)
+    ]
+
+    # Dynamic programming over fretboard positions.
     dp_cost: list[list[float]] = []
     dp_prev: list[list[int]] = []
 
     first_costs = [
-        (fret * 0.6) - (0.5 if fret == 0 else 0.0)
-        for _, fret, _ in candidates_per_note[0]
+        _position_cost(s_num, fret, fitted_midi, open_e_mask[0])
+        for s_num, fret, fitted_midi in candidates_per_note[0]
     ]
     dp_cost.append(first_costs)
     dp_prev.append([-1] * len(first_costs))
@@ -143,15 +231,16 @@ def assign_bass_tab_positions(
         prev_opts = candidates_per_note[idx - 1]
         cur_costs: list[float] = []
         cur_back: list[int] = []
-        for s_cur, f_cur, _ in cur_opts:
-            base_cost = (f_cur * 0.6) - (0.4 if f_cur == 0 else 0.0)
+        ctx_open_e = open_e_mask[idx] or open_e_mask[idx - 1]
+        for s_cur, f_cur, m_cur in cur_opts:
+            base_cost = _position_cost(s_cur, f_cur, m_cur, open_e_mask[idx])
             best_total = float("inf")
             best_prev = 0
-            for p_idx, (s_prev, f_prev, _) in enumerate(prev_opts):
-                # Open strings don't anchor hand fret position strongly, scale jump cost slightly.
-                fret_jump = abs(f_cur - f_prev) * (0.4 if (f_cur == 0 or f_prev == 0) else 1.4)
-                string_jump = abs(s_cur - s_prev) * 0.35
-                total = dp_cost[idx - 1][p_idx] + base_cost + fret_jump + string_jump
+            for p_idx, (s_prev, f_prev, m_prev) in enumerate(prev_opts):
+                trans = _transition_cost(
+                    s_prev, f_prev, m_prev, s_cur, f_cur, m_cur, ctx_open_e
+                )
+                total = dp_cost[idx - 1][p_idx] + base_cost + trans
                 if total < best_total:
                     best_total = total
                     best_prev = p_idx
@@ -333,25 +422,50 @@ def _quantize_notes_to_grid(
     bpm: float,
     beats_per_measure: int,
 ) -> tuple[int, list[dict]]:
-    """Snap notes to a non-overlapping 16th-note grid across measures."""
+    """Snap notes to a non-overlapping 16th-note grid with 8th-note rhythm stabilization."""
     measure_div = beats_per_measure * DIVISIONS_PER_QUARTER
     div_sec = (60.0 / max(bpm, 20.0)) / DIVISIONS_PER_QUARTER
 
     if not notes:
         return 1, []
 
+    ordered = sorted(notes, key=lambda item: item.onset_sec)
     grid_items: list[dict] = []
-    for n in sorted(notes, key=lambda item: item.onset_sec):
-        start_div = max(0, int(round(n.onset_sec / div_sec)))
+    for idx, n in enumerate(ordered):
+        raw_start = max(0.0, n.onset_sec / div_sec)
+        start_div = max(0, int(round(raw_start)))
+        prev_ioi = (n.onset_sec - ordered[idx - 1].onset_sec) if idx > 0 else float("inf")
+        next_ioi = (ordered[idx + 1].onset_sec - n.onset_sec) if idx + 1 < len(ordered) else float("inf")
+        if start_div % 2 == 1 and min(prev_ioi, next_ioi) >= 0.75 * (2.0 * div_sec):
+            candidates = [c for c in (start_div - 1, start_div + 1) if c >= 0]
+            even_div = min(candidates, key=lambda c: abs(raw_start - c))
+            if abs(raw_start - even_div) <= 0.62:
+                start_div = even_div
+
         dur_div = max(1, int(round(n.duration_sec / div_sec)))
         if grid_items and start_div <= grid_items[-1]["start_div"]:
-            if start_div == grid_items[-1]["start_div"]:
-                continue
+            continue
         if grid_items:
             prev = grid_items[-1]
             if prev["start_div"] + prev["dur_div"] > start_div:
                 prev["dur_div"] = max(1, start_div - prev["start_div"])
         grid_items.append({"start_div": start_div, "dur_div": dur_div, "note": n})
+
+    # Stabilize plucked 8th/quarter notes so acoustic decay does not fragment into 16th rests.
+    for idx, item in enumerate(grid_items):
+        if idx + 1 < len(grid_items):
+            gap_to_next = grid_items[idx + 1]["start_div"] - item["start_div"]
+        else:
+            gap_to_next = measure_div - (item["start_div"] % measure_div)
+
+        if item["dur_div"] == 1 and gap_to_next >= 2 and item["note"].duration_sec >= 1.05 * div_sec:
+            item["dur_div"] = 2
+        if (
+            gap_to_next - item["dur_div"] == 1
+            and item["start_div"] % 2 == 0
+            and (item["dur_div"] + 1) % 2 == 0
+        ):
+            item["dur_div"] += 1
 
     last_end = max(it["start_div"] + it["dur_div"] for it in grid_items)
     total_measures = max(1, (last_end + measure_div - 1) // measure_div)

@@ -6,8 +6,10 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from bass_mcp.score_builder import (
+    _quantize_notes_to_grid,
     assign_bass_tab_positions,
     infer_measure_chords,
+    normalize_note_onsets,
     render_ascii_bass_tab,
     write_midi_file,
     write_musicxml_score,
@@ -77,3 +79,64 @@ def test_write_musicxml_and_midi_escapes_xml_injection(tmp_path: Path) -> None:
     ascii_tab = render_ascii_bass_tab(tabbed, chords, bpm=120.0)
     assert "G|" in ascii_tab and "E|" in ascii_tab
     assert "Em" in ascii_tab or "E" in ascii_tab
+
+
+def test_assign_bass_tab_positions_spyair_chorus_horizontal() -> None:
+    pitches = [36, 36, 36, 36, 32, 32, 32, 32, 39, 39, 39, 39, 38, 38, 38, 38]
+    notes = [BassNote(p, "N", i * 0.265, 0.22) for i, p in enumerate(pitches)]
+    tabbed = assign_bass_tab_positions(notes, string_count=4)
+    coords = [(t.string_num, t.fret) for t in tabbed]
+    assert coords == [(3, 3)] * 4 + [(4, 4)] * 4 + [(3, 6)] * 4 + [(3, 5)] * 4
+
+
+def test_assign_bass_tab_positions_octave_shapes_prechorus() -> None:
+    pitches = [29, 41, 31, 43, 32, 44, 34, 46]
+    notes = [BassNote(p, "N", i * 0.265, 0.20) for i, p in enumerate(pitches)]
+    tabbed = assign_bass_tab_positions(notes, string_count=4)
+    coords = [(t.string_num, t.fret) for t in tabbed]
+    assert coords == [
+        (4, 1),
+        (2, 3),
+        (4, 3),
+        (2, 5),
+        (4, 4),
+        (2, 6),
+        (4, 6),
+        (2, 8),
+    ]
+
+
+def test_assign_bass_tab_positions_intro_and_bridge() -> None:
+    intro_pitches = [32, 31, 43, 31, 36, 39]
+    intro_notes = [BassNote(p, "N", i * 0.265, 0.20) for i, p in enumerate(intro_pitches)]
+    intro_tab = [(t.string_num, t.fret) for t in assign_bass_tab_positions(intro_notes, 4)]
+    assert intro_tab == [(4, 4), (4, 3), (2, 5), (4, 3), (3, 3), (3, 6)]
+
+    bridge_pitches = [34, 34, 35, 35, 37, 37]
+    bridge_notes = [BassNote(p, "N", i * 0.265, 0.20) for i, p in enumerate(bridge_pitches)]
+    bridge_tab = [(t.string_num, t.fret) for t in assign_bass_tab_positions(bridge_notes, 4)]
+    assert bridge_tab[2:4] == [(4, 7), (4, 7)]
+    assert all(f >= 4 for _, f in bridge_tab[4:6])
+
+
+def test_quantize_notes_prevents_16th_rest_fragmentation(tmp_path: Path) -> None:
+    # Leading 9.067s intro silence + 8 plucked 8th notes with 0.18s sustain at 113 BPM
+    raw_notes = [
+        BassNote(36, "C2", 9.067 + i * 0.266, 0.18)
+        for i in range(8)
+    ]
+    aligned = normalize_note_onsets(raw_notes)
+    assert aligned[0].onset_sec == 0.0
+
+    tabbed = assign_bass_tab_positions(aligned, string_count=4)
+    total_measures, items = _quantize_notes_to_grid(tabbed, bpm=113.0, beats_per_measure=4)
+    assert total_measures == 1
+    assert [(it["start_div"], it["dur_div"]) for it in items] == [(i * 2, 2) for i in range(8)]
+
+    xml_path = tmp_path / "clean_8ths.musicxml"
+    chords = infer_measure_chords(tabbed, bpm=113.0)
+    write_musicxml_score(tabbed, chords, xml_path, bpm=113.0)
+    root = ET.parse(xml_path).getroot()
+    staff1_notes = [n for n in root.findall(".//measure[@number='1']/note") if n.findtext("staff") == "1"]
+    assert all(n.find("rest") is None for n in staff1_notes)
+    assert [n.findtext("type") for n in staff1_notes] == ["eighth"] * 8

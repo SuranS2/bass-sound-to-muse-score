@@ -21,7 +21,7 @@ def has_demucs() -> bool:
 
 
 def _bandpass_bass_wav(audio_wav: Path, out_wav: Path) -> Path:
-    """Isolate bass frequencies (30 Hz - 350 Hz) using a 4th-order Butterworth bandpass filter."""
+    """Isolate bass frequencies (30 Hz - 260 Hz) using a 4th-order Butterworth bandpass filter."""
     sr, data = wavfile.read(str(audio_wav))
     if data.ndim > 1:
         data = data.mean(axis=1)
@@ -37,7 +37,7 @@ def _bandpass_bass_wav(audio_wav: Path, out_wav: Path) -> Path:
 
     nyquist = sr * 0.5
     low_hz = max(25.0, min(30.0, nyquist * 0.2))
-    high_hz = min(350.0, nyquist * 0.85)
+    high_hz = min(260.0, nyquist * 0.85)
     if low_hz >= high_hz:
         filtered = signal
     else:
@@ -104,4 +104,4 @@ def separate_bass_stem(audio_wav: Path, job_dir: Path, method: str = "auto") -> 
 
     out_wav = job_dir / "bass_isolated.wav"
     _bandpass_bass_wav(audio_wav, out_wav)
-    return {"bass_wav": out_wav, "engine": "scipy:bandpass_30_350hz"}
+    return {"bass_wav": out_wav, "engine": "scipy:bandpass_30_260hz"}
