@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 from scipy.io import wavfile
 
+from bass_mcp.metadata import _fetch_allowlisted_json, parse_song_artist
 from bass_mcp.security import SecurityValidationError
 from bass_mcp.server import (
     audio_to_bass_score,
@@ -16,7 +17,7 @@ from bass_mcp.server import (
     separate_bass_track,
     transcribe_bass_pipeline,
 )
-from bass_mcp.transcriber import midi_to_hz
+from bass_mcp.transcriber import has_librosa, midi_to_hz, transcribe_bass_notes
 
 
 def _synthesize_bass_riff_wav(path: Path, sr: int = 44100) -> Path:
@@ -110,3 +111,85 @@ def test_check_environment_status() -> None:
     assert "spotify/basic-pitch" in projects
     assert "facebookresearch/demucs" in projects
     assert "ghchen99/mcp-musescore" in projects
+
+
+def test_parse_song_artist_and_lookup_security() -> None:
+    meta = parse_song_artist(
+        "22. 은혼 17기 ED, SPYAIR - Some Like It Hot 베이스 커버 【★★★☆☆】 | BassGuitar tutorial | 악보[TAB]"
+    )
+    assert meta["artist"] == "SPYAIR"
+    assert meta["song_title"] == "Some Like It Hot"
+    assert meta["display_name"] == "SPYAIR - Some Like It Hot"
+    assert meta["web_search_query"] == "SPYAIR Some Like It Hot BPM"
+
+    with pytest.raises(SecurityValidationError):
+        _fetch_allowlisted_json("http://api.deezer.com/search?q=test")
+    with pytest.raises(SecurityValidationError):
+        _fetch_allowlisted_json("https://127.0.0.1/metadata")
+
+
+@pytest.mark.asyncio
+async def test_pipeline_pauses_for_bpm_confirmation_then_finalizes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    out_root = tmp_path / "mcp_output"
+    monkeypatch.setenv("BASS_MCP_OUTPUT_DIR", str(out_root))
+    monkeypatch.setattr(
+        "bass_mcp.server.lookup_original_song_bpm",
+        lambda song_title, artist="": {
+            "query": f"{artist} {song_title}".strip(),
+            "web_search_query": "SPYAIR Some Like It Hot BPM",
+            "found": True,
+            "bpm": 113.0,
+            "source": "mock:test",
+            "canonical_artist": "SPYAIR",
+            "canonical_title": "Some Like It Hot!!",
+        },
+    )
+
+    input_wav = _synthesize_bass_riff_wav(tmp_path / "SPYAIR - Some Like It Hot [Bass Cover].wav")
+    pending = await transcribe_bass_pipeline(
+        source=str(input_wav),
+        bpm=None,
+        separation_method="lowpass",
+        send_to_musescore=False,
+    )
+    assert pending["status"] == "needs_bpm_confirmation"
+    assert pending["requires_user_confirmation"] is True
+    assert pending["recommended_bpm"] == 113.0
+    assert pending["song_metadata"]["canonical_artist"] == "SPYAIR"
+    assert "SPYAIR" in pending["confirmation_prompt_ko"]
+    assert Path(pending["files"]["bass_wav"]).is_file()
+
+    # Simulate user confirming/correcting BPM to 113.0 and generating final score from cached bass_wav.
+    final = audio_to_bass_score(
+        audio_path=pending["files"]["bass_wav"],
+        title=pending["title"],
+        bpm=113.0,
+    )
+    assert final["status"] == "ok"
+    assert final["bpm"] == 113.0
+    assert Path(final["files"]["musicxml"]).is_file()
+
+
+def test_repeated_same_pitch_notes_split_cleanly(tmp_path: Path) -> None:
+    if not has_librosa():
+        pytest.skip("librosa not installed")
+
+    sr = 22050
+    f0 = midi_to_hz(36)  # C2
+    note_dur = 0.25  # 8th notes at 120 BPM
+    chunks = []
+    for _ in range(6):
+        t = np.linspace(0.0, note_dur, int(sr * note_dur), endpoint=False)
+        env = np.minimum(1.0, t / 0.01) * np.exp(-3.5 * t)
+        wave = (0.75 * np.sin(2.0 * np.pi * f0 * t) + 0.25 * np.sin(4.0 * np.pi * f0 * t)) * env
+        chunks.append(wave)
+    audio = np.concatenate(chunks)
+    wav_path = tmp_path / "repeated_c2.wav"
+    wavfile.write(str(wav_path), sr, np.clip(audio * 24000.0, -32768, 32767).astype(np.int16))
+
+    res = transcribe_bass_notes(wav_path, min_midi=28)
+    assert res["engine"] == "librosa:pyin"
+    assert len(res["notes"]) >= 5

@@ -17,6 +17,7 @@ except ImportError:  # pragma: no cover - mcp 1.x fallback
     from mcp.server.fastmcp import FastMCP
 
 from bass_mcp.downloader import acquire_audio
+from bass_mcp.metadata import lookup_original_song_bpm, parse_song_artist
 from bass_mcp.musescore_bridge import MuseScoreBridge
 from bass_mcp.score_builder import (
     TabbedBassNote,
@@ -47,7 +48,18 @@ from bass_mcp.transcriber import (
     transcribe_bass_notes,
 )
 
-mcp = FastMCP("bass-sound-to-musescore")
+_SERVER_INSTRUCTIONS = (
+    "For YouTube/audio bass transcription, when the user has not explicitly specified a BPM, "
+    "call transcribe_bass_pipeline with bpm=None first. It returns song_metadata (song_title, artist), "
+    "audio_estimated_bpm, web_bpm_lookup, and a ready bass_wav stem with status='needs_bpm_confirmation'. "
+    "If the track has an original song and web_bpm_lookup.bpm is null, also use your own web search "
+    "(e.g. web_bpm_lookup.web_search_query) to check the original track's BPM. "
+    "Always show the user the detected '곡 명 - 가수' and BPM, ask them to confirm or enter a corrected BPM, "
+    "and then call audio_to_bass_score(audio_path=files['bass_wav'], title=<confirmed title>, bpm=<confirmed bpm>) "
+    "to generate the final MusicXML, MSCZ, MIDI, and TAB without re-running stem separation."
+)
+
+mcp = FastMCP("bass-sound-to-musescore", instructions=_SERVER_INSTRUCTIONS)
 
 _XML_DOCTYPE_RE = re.compile(rb"<!(?:DOCTYPE|ENTITY)\b", re.IGNORECASE)
 _MAX_PUSH_PAYLOAD_BYTES = 2 * 1024 * 1024
@@ -112,6 +124,23 @@ def _build_score_artifacts(
     }
 
 
+def _resolve_song_metadata(acq: dict[str, Any], requested_title: str) -> tuple[dict[str, str], str]:
+    meta = dict(acq.get("song_metadata") or {})
+    if not meta:
+        meta = parse_song_artist(raw_title=str(acq.get("id") or requested_title))
+    if requested_title.strip() and requested_title.strip() != "Bass Score":
+        effective = _sanitize_title(requested_title)
+    else:
+        effective = _sanitize_title(meta.get("display_name") or requested_title)
+    return meta, effective
+
+
+@mcp.tool()
+def lookup_song_bpm(song_title: str, artist: str = "") -> dict[str, Any]:
+    """Look up canonical song metadata and original BPM from allowlisted public music APIs."""
+    return lookup_original_song_bpm(song_title=song_title, artist=artist)
+
+
 @mcp.tool()
 async def transcribe_bass_pipeline(
     source: str,
@@ -120,15 +149,75 @@ async def transcribe_bass_pipeline(
     separation_method: str = "auto",
     string_count: int = 4,
     send_to_musescore: bool = False,
+    auto_confirm_bpm: bool = False,
 ) -> dict[str, Any]:
-    """Convert a YouTube URL or local audio file into Bass MusicXML, 4/5-string TAB, chords, and MIDI."""
-    safe_title = _sanitize_title(title)
+    """Convert a YouTube URL or local audio file into Bass MusicXML, 4/5-string TAB, chords, and MIDI.
+
+    When bpm is omitted and auto_confirm_bpm is False, extracts song metadata, isolates the bass stem,
+    checks public BPM lookup, and returns status='needs_bpm_confirmation' so the user can confirm or
+    correct 'song_title - artist' and BPM before generating final score files with audio_to_bass_score.
+    """
     min_midi = _min_midi_for_strings(string_count)
     job_dir = prepare_job_output_dir(_get_output_root())
 
     acq = acquire_audio(source=source, job_dir=job_dir)
+    song_meta, safe_title = _resolve_song_metadata(acq, title)
     sep = separate_bass_stem(acq["wav_path"], job_dir=job_dir, method=separation_method)
     trans = transcribe_bass_notes(sep["bass_wav"], min_midi=min_midi, bpm_hint=bpm)
+
+    if (bpm is None or bpm <= 0) and not auto_confirm_bpm:
+        web_lookup = lookup_original_song_bpm(
+            song_title=song_meta.get("song_title", ""),
+            artist=song_meta.get("artist", ""),
+        )
+        canonical_artist = web_lookup.get("canonical_artist") or song_meta.get("artist") or ""
+        canonical_title = web_lookup.get("canonical_title") or song_meta.get("song_title") or safe_title
+        display_name = (
+            f"{canonical_artist} - {canonical_title}"
+            if canonical_artist and canonical_title
+            else safe_title
+        )
+        suggested_bpm = web_lookup["bpm"] if web_lookup.get("bpm") else trans["estimated_bpm"]
+        return {
+            "status": "needs_bpm_confirmation",
+            "requires_user_confirmation": True,
+            "title": display_name,
+            "job_dir": str(job_dir),
+            "source_type": acq["source_type"],
+            "source_ref": acq["source_ref"],
+            "duration_sec": acq["duration_sec"],
+            "string_count": string_count,
+            "song_metadata": {
+                **song_meta,
+                "canonical_artist": canonical_artist,
+                "canonical_title": canonical_title,
+                "display_name": display_name,
+            },
+            "audio_estimated_bpm": trans["estimated_bpm"],
+            "web_bpm_lookup": web_lookup,
+            "recommended_bpm": suggested_bpm,
+            "engines": {
+                "separator": sep["engine"],
+                "transcriber": trans["engine"],
+            },
+            "note_count_preview": len(trans["notes"]),
+            "files": {
+                "source_wav": str(acq["wav_path"]),
+                "bass_wav": str(sep["bass_wav"]),
+            },
+            "confirmation_prompt_ko": (
+                f"감지된 곡 명-가수: {display_name}\n"
+                f"추정 BPM: {suggested_bpm} BPM (오디오 자동 추정: {trans['estimated_bpm']} BPM)\n"
+                "원본 곡 명-가수와 BPM이 맞는지 확인해 주세요. 틀렸다면 수정할 곡명이나 BPM을 입력해 주세요."
+            ),
+            "next_step_instructions": (
+                "If this track has an original release and web_bpm_lookup.bpm is null, run a web search "
+                "using web_bpm_lookup.web_search_query to check the original BPM. Then present the song "
+                "name - artist and BPM to the user, ask for confirmation or a corrected BPM, and call "
+                "audio_to_bass_score(audio_path=files['bass_wav'], title=<confirmed_title>, "
+                "bpm=<confirmed_bpm>, string_count=...) to finalize the score."
+            ),
+        }
 
     effective_bpm = float(bpm) if bpm and bpm > 0 else float(trans["estimated_bpm"])
     scored = _build_score_artifacts(
@@ -148,6 +237,7 @@ async def transcribe_bass_pipeline(
     return {
         "status": "ok",
         "title": safe_title,
+        "song_metadata": song_meta,
         "job_dir": str(job_dir),
         "source_type": acq["source_type"],
         "source_ref": acq["source_ref"],

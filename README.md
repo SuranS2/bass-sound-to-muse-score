@@ -76,9 +76,10 @@ Claude Desktop, Cursor, Claude Code, Gemini CLI 등의 MCP 설정 파일에 아�
 
 | Tool | 설명 |
 |---|---|
-| `transcribe_bass_pipeline` | 유튜브 URL 또는 로컬 음원 → 베이스 분리 → 채보 → 코드/TAB/MusicXML/MIDI/MSCZ 원스톱 실행 |
+| `transcribe_bass_pipeline` | 유튜브 URL 또는 로컬 음원 → 곡명/가수·BPM 확인 요청(미확정 시 `needs_bpm_confirmation`) 후 코드/TAB/MusicXML/MIDI/MSCZ 생성 |
+| `lookup_song_bpm` | 허용된 공개 음악 API(`iTunes`/`Deezer`)로 곡명-가수 정규화 및 원본 BPM 조회 |
 | `separate_bass_track` | 유튜브 URL 또는 음원에서 베이스 트랙 WAV만 분리 |
-| `audio_to_bass_score` | 이미 분리된 베이스 오디오 파일을 악보(`.musicxml`, `.mid`, ASCII TAB)로 변환 |
+| `audio_to_bass_score` | 이미 분리된 베이스 오디오 파일을 확정된 BPM/제목으로 악보(`.musicxml`, `.mid`, ASCII TAB) 변환 |
 | `musescore_live_push` | 생성된 노트 JSON 또는 MusicXML을 실행 중인 MuseScore 4로 전송 (`127.0.0.1:8765`) |
 | `check_environment_status` | `ffmpeg`, `yt-dlp`, `demucs`, `basic-pitch`, MuseScore CLI 설치 상태 및 라이선스 정보 확인 |
 
