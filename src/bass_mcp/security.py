@@ -1,0 +1,253 @@
+"""Security guards for URL validation, local path checks, and subprocess execution."""
+
+from __future__ import annotations
+
+import os
+import re
+import stat
+import subprocess
+import time
+import uuid
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+ALLOWED_YOUTUBE_HOSTS = frozenset(
+    {
+        "www.youtube.com",
+        "youtube.com",
+        "m.youtube.com",
+        "music.youtube.com",
+        "youtu.be",
+    }
+)
+ALLOWED_AUDIO_EXTENSIONS = frozenset({".wav", ".mp3", ".flac", ".ogg", ".m4a"})
+MAX_AUDIO_FILE_BYTES = 200 * 1024 * 1024
+MAX_URL_LENGTH = 2048
+
+_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+_JOB_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_URI_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
+
+_SAFE_ENV_KEYS = (
+    "PATH",
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "HOME",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PATHEXT",
+    "COMSPEC",
+)
+
+
+class SecurityValidationError(ValueError):
+    """Raised when an untrusted input violates a security boundary."""
+
+
+class SubprocessExecutionError(RuntimeError):
+    """Raised when a sandboxed external command fails."""
+
+
+def is_uri_input(value: str) -> bool:
+    """Return True if value looks like a URI with an explicit scheme."""
+    return bool(_URI_SCHEME_RE.match(value.strip()))
+
+
+def _check_no_control_chars(value: str, label: str) -> str:
+    if not isinstance(value, str):
+        raise SecurityValidationError(f"{label} must be a string.")
+    cleaned = value.strip()
+    if not cleaned:
+        raise SecurityValidationError(f"{label} must not be empty.")
+    if _CONTROL_CHARS_RE.search(cleaned):
+        raise SecurityValidationError(f"{label} contains disallowed control characters.")
+    return cleaned
+
+
+def _check_not_windows_device_name(name: str, label: str) -> None:
+    stem = name.split(".", 1)[0].upper()
+    if stem in _WINDOWS_RESERVED_NAMES:
+        raise SecurityValidationError(f"{label} uses reserved device name: {name}")
+
+
+def validate_youtube_url(url: str) -> tuple[str, str]:
+    """Validate and canonicalize a YouTube URL to prevent SSRF and flag injection.
+
+    Returns ``(video_id, canonical_watch_url)``.
+    """
+    cleaned = _check_no_control_chars(url, "YouTube URL")
+    if len(cleaned) > MAX_URL_LENGTH:
+        raise SecurityValidationError("YouTube URL exceeds maximum allowed length.")
+    if cleaned.startswith("-"):
+        raise SecurityValidationError("YouTube URL must not start with '-'.")
+
+    parsed = urlparse(cleaned)
+    if parsed.scheme.lower() != "https":
+        raise SecurityValidationError("Only https:// YouTube URLs are permitted.")
+    if parsed.username is not None or parsed.password is not None:
+        raise SecurityValidationError("Credentials in URLs are not permitted.")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise SecurityValidationError("Invalid port in URL.") from exc
+    if port not in (None, 443):
+        raise SecurityValidationError("Non-standard ports are not permitted.")
+
+    host = (parsed.hostname or "").lower()
+    if host not in ALLOWED_YOUTUBE_HOSTS:
+        raise SecurityValidationError(f"Host '{host}' is not an allowed YouTube domain.")
+
+    video_id: str | None = None
+    if host == "youtu.be":
+        segment = parsed.path.strip("/")
+        if "/" not in segment and _VIDEO_ID_RE.fullmatch(segment):
+            video_id = segment
+    elif parsed.path == "/watch":
+        v_values = parse_qs(parsed.query).get("v", [])
+        if len(v_values) == 1 and _VIDEO_ID_RE.fullmatch(v_values[0]):
+            video_id = v_values[0]
+    else:
+        for prefix in ("/shorts/", "/live/", "/embed/"):
+            if parsed.path.startswith(prefix):
+                candidate = parsed.path[len(prefix) :].strip("/")
+                if "/" not in candidate and _VIDEO_ID_RE.fullmatch(candidate):
+                    video_id = candidate
+                break
+
+    if not video_id:
+        raise SecurityValidationError("Could not extract a valid 11-character YouTube video ID.")
+
+    return video_id, f"https://www.youtube.com/watch?v={video_id}"
+
+
+def _parse_allowed_dirs(allowed_dirs: list[Path] | None) -> list[Path]:
+    if allowed_dirs is not None:
+        return [Path(d).resolve() for d in allowed_dirs]
+    env_dirs = os.environ.get("BASS_MCP_ALLOWED_DIRS", "").strip()
+    if not env_dirs:
+        return []
+    return [Path(p).resolve() for p in env_dirs.split(os.pathsep) if p.strip()]
+
+
+def validate_input_audio_path(
+    file_path: str,
+    allowed_dirs: list[Path] | None = None,
+) -> Path:
+    """Validate a local audio path against traversal, symlinks, devices, and size limits."""
+    cleaned = _check_no_control_chars(file_path, "Audio path")
+    if is_uri_input(cleaned):
+        raise SecurityValidationError("URI schemes are not accepted as local file paths.")
+    if cleaned.startswith("\\\\") or cleaned.startswith("//"):
+        raise SecurityValidationError("UNC network paths are not permitted.")
+
+    raw = Path(cleaned)
+    for part in raw.parts:
+        _check_not_windows_device_name(part, "Audio path component")
+
+    if raw.is_symlink():
+        raise SecurityValidationError("Symbolic links are not permitted as audio input.")
+
+    try:
+        resolved = raw.resolve(strict=True)
+    except OSError as exc:
+        raise SecurityValidationError(f"Audio file does not exist or cannot be resolved: {cleaned}") from exc
+
+    _check_not_windows_device_name(resolved.name, "Resolved audio filename")
+    if resolved.is_symlink():
+        raise SecurityValidationError("Resolved audio path must not be a symlink.")
+
+    st = resolved.stat()
+    if not stat.S_ISREG(st.st_mode):
+        raise SecurityValidationError("Audio path must point to a regular file.")
+    if resolved.suffix.lower() not in ALLOWED_AUDIO_EXTENSIONS:
+        raise SecurityValidationError(
+            f"Unsupported audio extension '{resolved.suffix}'. Allowed: {sorted(ALLOWED_AUDIO_EXTENSIONS)}"
+        )
+    if st.st_size <= 0 or st.st_size > MAX_AUDIO_FILE_BYTES:
+        raise SecurityValidationError(
+            f"Audio file size ({st.st_size} bytes) must be between 1 byte and {MAX_AUDIO_FILE_BYTES} bytes."
+        )
+
+    effective_dirs = _parse_allowed_dirs(allowed_dirs)
+    if effective_dirs and not any(resolved.is_relative_to(d) for d in effective_dirs):
+        raise SecurityValidationError("Audio file lies outside configured allowed directories.")
+
+    return resolved
+
+
+def prepare_job_output_dir(base_output_dir: Path, job_id: str | None = None) -> Path:
+    """Create and return an isolated job subdirectory strictly under base_output_dir."""
+    base = Path(base_output_dir).resolve()
+    base.mkdir(parents=True, exist_ok=True)
+
+    if job_id is None:
+        safe_id = f"job_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    else:
+        safe_id = _check_no_control_chars(job_id, "job_id")
+        if not _JOB_ID_RE.fullmatch(safe_id):
+            raise SecurityValidationError("job_id must match ^[A-Za-z0-9_-]{1,64}$.")
+        _check_not_windows_device_name(safe_id, "job_id")
+
+    job_dir = (base / safe_id).resolve()
+    if job_dir == base or not job_dir.is_relative_to(base):
+        raise SecurityValidationError("Resolved job directory escaped base output directory.")
+    job_dir.mkdir(parents=True, exist_ok=True)
+    return job_dir
+
+
+def build_safe_env(extra_env: dict[str, str] | None = None) -> dict[str, str]:
+    """Return a minimal allowlisted environment dictionary without inherited secrets."""
+    env: dict[str, str] = {}
+    for key in _SAFE_ENV_KEYS:
+        val = os.environ.get(key)
+        if val is not None:
+            env[key] = val
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    if extra_env:
+        env.update(extra_env)
+    return env
+
+
+def run_safe_command(
+    args: list[str],
+    timeout: int = 300,
+    cwd: Path | None = None,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    """Execute a subprocess safely without a shell and with scrubbed environment variables."""
+    if not isinstance(args, list) or not args:
+        raise SecurityValidationError("Command arguments must be a non-empty list.")
+    clean_args: list[str] = []
+    for arg in args:
+        if not isinstance(arg, str) or not arg or "\x00" in arg:
+            raise SecurityValidationError("Each command argument must be a non-empty string without null bytes.")
+        clean_args.append(arg)
+
+    proc = subprocess.run(
+        clean_args,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+        shell=False,
+        timeout=timeout,
+        cwd=str(cwd) if cwd is not None else None,
+        env=build_safe_env(),
+    )
+    if check and proc.returncode != 0:
+        stderr_tail = (proc.stderr or "").strip()[-800:]
+        raise SubprocessExecutionError(
+            f"Command {Path(clean_args[0]).name} failed with exit code {proc.returncode}: {stderr_tail}"
+        )
+    return proc
