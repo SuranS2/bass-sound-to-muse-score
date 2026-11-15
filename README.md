@@ -38,8 +38,8 @@ python -m venv .venv
 .venv\Scripts\pip install -e .
 ```
 
-### 2. 고품질 ML 엔진 포함 설치 (Demucs + Spotify Basic Pitch)
-> 참고: `ffmpeg`가 시스템 `PATH`에 설치되어 있어야 유튜브/MP3/M4A 변환이 가능합니다.
+### 2. 고품질 ML 엔진 포함 설치 (Demucs + Librosa pYIN / Python 3.10~3.11에서는 Basic Pitch 포함)
+> 참고: `ffmpeg`가 시스템 `PATH`에 설치되어 있어야 유튜브/MP3/M4A 변환이 가능합니다. Python 3.12+ 환경에서는 TensorFlow 미지원으로 `basic-pitch`가 자동 제외되며 `demucs` + `librosa:pyin` 엔진이 동작합니다.
 ```powershell
 .venv\Scripts\pip install -e ".[ml]"
 ```
